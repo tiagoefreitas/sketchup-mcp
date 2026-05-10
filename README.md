@@ -20,26 +20,59 @@ The system consists of two main components:
 1. **Sketchup Extension**: A Sketchup extension that creates a TCP server within Sketchup to receive and execute commands
 2. **MCP Server (`sketchup_mcp/server.py`)**: A Python server that implements the Model Context Protocol and connects to the Sketchup extension
 
+## Requirements
+
+- SketchUp 2021 or newer (the extension uses `UI.start_timer` and
+  modern Ruby APIs available in 2021+)
+- Python 3.10 or newer
+- macOS or Windows — both are supported. The install hints below show
+  Homebrew commands; on Windows use the equivalent step linked in
+  each tool's docs.
+
 ## Installation
 
 ### Python Packaging
 
-We're using uv so you'll need to ```brew install uv```
+We're using uv, so you'll need to install it. On macOS:
+
+```bash
+brew install uv
+```
+
+For other platforms see the [uv install docs](https://docs.astral.sh/uv/getting-started/installation/).
 
 ### Sketchup Extension
 
-1. Download or build the latest `.rbz` file
+1. Build the `.rbz` from this repo:
+   ```bash
+   make rbz
+   ```
+   This runs `scripts/build_rbz.sh` and produces `su_mcp_v<version>.rbz`
+   in the repo root (the version comes from `su_mcp/extension.json`).
 2. In Sketchup, go to Window > Extension Manager
-3. Click "Install Extension" and select the downloaded `.rbz` file
+3. Click "Install Extension" and select the `.rbz` file you just built
 4. Restart Sketchup
 
 ## Usage
 
 ### Starting the Connection
 
-1. In Sketchup, go to Extensions > SketchupMCP > Start Server
-2. The server will start on the default port (9876)
-3. Make sure the MCP server is running in your terminal
+1. In Sketchup, go to Extensions > SketchupMCP > Start Server. The
+   extension listens on `localhost:9876`.
+2. Start the MCP server in a terminal so you can verify the
+   connection before wiring it up to a client:
+   ```bash
+   uvx sketchup-mcp
+   ```
+   On a successful probe you'll see a log line like:
+   ```
+   SketchupMCP Server version 0.1.17 starting up
+   SketchUp reachable at localhost:9876
+   ```
+   If the second line says "SketchUp not reachable", confirm step 1
+   completed and that nothing else is bound to port 9876.
+3. Leave the server running, or stop it with `Ctrl-C` once you're
+   ready to launch it from your MCP client (see below).
 
 ### Using with Claude
 
@@ -62,13 +95,15 @@ Once connected, Claude can interact with Sketchup using the following capabiliti
 
 #### Tools
 
-* `get_scene_info` - Gets information about the current Sketchup scene
-* `get_selected_components` - Gets information about currently selected components
-* `create_component` - Create a new component with specified parameters
-* `delete_component` - Remove a component from the scene
+* `create_component` - Create a new component with specified type, position, and dimensions
+* `delete_component` - Remove a component from the scene by ID
 * `transform_component` - Move, rotate, or scale a component
-* `set_material` - Apply materials to components
-* `export_scene` - Export the current scene to various formats
+* `get_selection` - Get information about currently selected components
+* `set_material` - Apply a material or color to a component
+* `export_scene` - Export the current scene (default format: `skp`)
+* `create_mortise_tenon` - Create a mortise-and-tenon joint between two components
+* `create_dovetail` - Create a dovetail joint between two components
+* `create_finger_joint` - Create a finger (box) joint between two components
 * `eval_ruby` - Execute arbitrary Ruby code in SketchUp for advanced operations
 
 ### Example Commands
@@ -76,10 +111,11 @@ Once connected, Claude can interact with Sketchup using the following capabiliti
 Here are some examples of what you can ask Claude to do:
 
 * "Create a simple house model with a roof and windows"
-* "Select all components and get their information"
+* "Get the current selection and tell me what's in it"
 * "Make the selected component red"
 * "Move the selected component 10 units up"
 * "Export the current scene as a 3D model"
+* "Join those two boards with a dovetail joint"
 * "Create a complex arts and crafts cabinet using Ruby code"
 
 ## Troubleshooting
