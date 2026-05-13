@@ -95,9 +95,12 @@ Once connected, Claude can interact with Sketchup using the following capabiliti
 
 #### Tools
 
+* `batch_create` - Run many create / mutate / delete operations as one SketchUp transaction (one undo step)
 * `create_component` - Create a new component with specified type, position, and dimensions
-* `delete_component` - Remove a component from the scene by ID
-* `transform_component` - Move, rotate, or scale a component
+* `create_extrusion` - Create a Group by extruding a 2D profile along x, y, or z (sloped tops, parallelogram rafters, fascia boards, etc.)
+* `delete_component` - Remove a component from the scene by entity ID or top-level group name
+* `transform_component` - Move, rotate, or scale a component, addressed by entity ID or top-level group name
+* `find_groups` - Query the model for groups by name prefix, regex, bounds intersection, or parent
 * `get_selection` - Get information about currently selected components
 * `set_material` - Apply a material or color to a component
 * `export_scene` - Export the current scene (default format: `skp`)
@@ -105,6 +108,108 @@ Once connected, Claude can interact with Sketchup using the following capabiliti
 * `create_dovetail` - Create a dovetail joint between two components
 * `create_finger_joint` - Create a finger (box) joint between two components
 * `eval_ruby` - Execute arbitrary Ruby code in SketchUp for advanced operations
+
+#### Batching many operations
+
+`batch_create` runs an array of operations as a single SketchUp transaction. The whole batch is one undo step, the wire round-trip happens once instead of per piece, and any failure aborts the transaction — the model is unchanged.
+
+One-at-a-time (3 separate round trips, 3 separate undo steps):
+
+```text
+create_component({"type": "cube", "position": [0, 0, 0], "dimensions": [16, 16, 8]})
+create_component({"type": "cube", "position": [24, 0, 0], "dimensions": [16, 16, 8]})
+create_component({"type": "cube", "position": [48, 0, 0], "dimensions": [16, 16, 8]})
+```
+
+Batched (one round trip, one undo step, named groups):
+
+```text
+batch_create({
+  "transaction_name": "Foundation blocks",
+  "operations": [
+    {"op": "cube", "name": "Block 1", "position": [0,  0, 0], "dimensions": [16, 16, 8]},
+    {"op": "cube", "name": "Block 2", "position": [24, 0, 0], "dimensions": [16, 16, 8]},
+    {"op": "cube", "name": "Block 3", "position": [48, 0, 0], "dimensions": [16, 16, 8]}
+  ]
+})
+```
+
+Mixing op kinds in one batch is the point — composes especially well with `find_groups` for "find these, then move them":
+
+```text
+batch_create({
+  "operations": [
+    {"op": "extrusion", "name": "Rafter W 1", "profile": [...], "extrude_axis": "y",
+     "extrude_from": 0.0,   "extrude_to": 1.5},
+    {"op": "extrusion", "name": "Rafter W 2", "profile": [...], "extrude_axis": "y",
+     "extrude_from": 15.25, "extrude_to": 16.75},
+    {"op": "translate", "id_or_name": "Ridge", "delta": [0, 0, 0.5]},
+    {"op": "delete",    "id_or_name": "Old Fascia"}
+  ]
+})
+```
+
+`id_or_name` is an integer entityID or a string group name. If a name matches more than one group the batch aborts — no ambiguous targets.
+
+#### Extruded profiles
+
+`create_extrusion` covers the most common shape in framing work — a 2D profile pushed along an axis — without dropping into `eval_ruby`. The 2D vertices are interpreted in the plane perpendicular to `extrude_axis`, and the face is auto-flipped so vertex winding doesn't matter.
+
+Before — about 20 lines of `eval_ruby` for one sloped rafter:
+
+```ruby
+g = Sketchup.active_model.active_entities.add_group
+g.name = "Rafter W 5"
+face = g.entities.add_face(
+  Geom::Point3d.new(-12, 15.25, 89.625),
+  Geom::Point3d.new(59.25, 15.25, 125.25),
+  Geom::Point3d.new(59.25, 15.25, 131.399),
+  Geom::Point3d.new(-12, 15.25, 95.774)
+)
+face.reverse! if face.normal.y < 0
+face.pushpull(1.5)
+```
+
+After — one call:
+
+```text
+create_extrusion({
+  "name": "Rafter W 5",
+  "profile": [[-12, 89.625], [59.25, 125.25], [59.25, 131.399], [-12, 95.774]],
+  "extrude_axis": "y",
+  "extrude_from": 15.25,
+  "extrude_to": 16.75
+})
+```
+
+`extrude_to` may be less than `extrude_from` (e.g. building a sloped stud top-down). An optional `material` argument applies a color or named material in the same call.
+
+#### Discovering existing geometry
+
+`find_groups` answers "what's already in the model?" without round-tripping through `eval_ruby`. Filters combine with AND; each match comes back with `id`, `name`, `bounds`, `layer`, and `material`. A `truncated: true` flag indicates results were capped at `limit` (default 200).
+
+Typical queries:
+
+* All Wall A pieces: `find_groups({"name_prefix": "WA "})`
+* Just the common rafters (excluding doubled/fly rafters): `find_groups({"name_pattern": "^Rafter [WE] \\d+$"})`
+* Everything that intersects the door rough-opening volume on Wall A: `find_groups({"in_bounds": {"min": [38, 0, 0], "max": [82, 3.5, 95]}})`
+
+Compose with the name-based mutate ops to operate on the model without tracking IDs:
+
+```text
+find_groups({"name_prefix": "WA "})       # list the pieces
+transform_component({"name": "Ridge",     # then mutate by name
+                     "move_to": [0, 0, 96]})
+```
+
+`name_prefix` and `name_pattern` are mutually exclusive. Pass `parent_id` to scope the search into a nested group. Bounds matching is intersection (not strict containment), since "what's near X?" is the more common need.
+
+#### Addressing entities: by ID or by name
+
+`delete_component` and `transform_component` accept exactly one of:
+
+* `id` — the integer entity ID returned by `create_*` calls. Cheapest and unambiguous; use it inside tight loops where the ID is fresh.
+* `name` — exact match against a top-level Group's name (e.g. `"Ridge"`, `"Rafter W 5"`). Prefer this for human-driven edits where IDs are easy to lose track of. Lookup errors clearly if zero or multiple groups share the name — there is no silent first-match.
 
 ### Example Commands
 

@@ -86,14 +86,17 @@ def envelope(text_content_result: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def test_all_ten_tools_are_registered(fake: FakeSketchupClient) -> None:
+async def test_every_tool_is_registered(fake: FakeSketchupClient) -> None:
     async with make_session() as session:
         listed = await session.list_tools()
     names = {t.name for t in listed.tools}
     assert names == {
+        "batch_create",
         "create_component",
+        "create_extrusion",
         "delete_component",
         "transform_component",
+        "find_groups",
         "get_selection",
         "set_material",
         "export_scene",
@@ -231,6 +234,52 @@ async def test_transform_component_forwards_move_to_alone(
 
 
 # ---------------------------------------------------------------------------
+# Name-based addressing — `name` is forwarded in place of `id` for
+# delete_component and transform_component. The actual resolution (and the
+# both/neither/not-found/ambiguous error paths) lives on the Ruby side and
+# is exercised by su_mcp/test/test_resolve_entity.rb. Here we just verify
+# the wire-level forwarding so a future rename in the Python tool can't
+# silently drop the parameter.
+# ---------------------------------------------------------------------------
+
+
+async def test_delete_component_forwards_name(fake: FakeSketchupClient) -> None:
+    async with make_session() as session:
+        await session.call_tool("delete_component", {"name": "Rafter W 5"})
+    assert fake.last_tool_name == "delete_component"
+    assert fake.last_arguments == {"name": "Rafter W 5"}
+    assert "id" not in fake.last_arguments
+
+
+async def test_transform_component_forwards_name(fake: FakeSketchupClient) -> None:
+    async with make_session() as session:
+        await session.call_tool("transform_component", {"name": "Ridge", "move_to": [0, 0, 5]})
+    assert fake.last_tool_name == "transform_component"
+    assert fake.last_arguments == {"name": "Ridge", "move_to": [0, 0, 5]}
+    assert "id" not in fake.last_arguments
+
+
+async def test_delete_component_forwards_neither_when_omitted(
+    fake: FakeSketchupClient,
+) -> None:
+    """When neither id nor name is given, both are omitted from the forwarded
+    payload; the Ruby side raises the both/neither validation error."""
+    async with make_session() as session:
+        await session.call_tool("delete_component", {})
+    assert fake.last_arguments == {}
+
+
+async def test_transform_component_forwards_both_when_both_given(
+    fake: FakeSketchupClient,
+) -> None:
+    """Python doesn't validate exclusivity — both are forwarded so the Ruby
+    side's resolve_entity is the single source of truth for the error."""
+    async with make_session() as session:
+        await session.call_tool("transform_component", {"id": "5", "name": "Ridge"})
+    assert fake.last_arguments == {"id": "5", "name": "Ridge"}
+
+
+# ---------------------------------------------------------------------------
 # Argument-name parity for every tool — catches typos in keys forwarded to
 # the Ruby side, which would otherwise fail silently as missing-arg errors
 # at runtime against a live SketchUp.
@@ -328,6 +377,12 @@ async def test_transform_component_forwards_move_to_alone(
             "eval_ruby",
             {"code": "1+1"},
         ),
+        (
+            "find_groups",
+            {},  # no filters — defaults forwarded
+            "find_groups",
+            {"limit": 200, "include_components": False},
+        ),
     ],
 )
 async def test_tool_forwards_expected_arguments(
@@ -357,3 +412,387 @@ async def test_eval_ruby_round_trip(fake: FakeSketchupClient) -> None:
     assert fake.last_tool_name == "eval_ruby"
     assert fake.last_arguments == {"code": "6 * 7"}
     assert envelope(result) == {"success": True, "result": "42", "error": None}
+
+
+# ---------------------------------------------------------------------------
+# find_groups — each filter must be forwarded under the right key. Filtering
+# logic itself lives in Ruby (see su_mcp/test/test_find_groups_filters.rb);
+# these tests pin the wire shape so a rename or dropped key can't slip past.
+# ---------------------------------------------------------------------------
+
+
+async def test_find_groups_forwards_name_prefix(fake: FakeSketchupClient) -> None:
+    async with make_session() as session:
+        await session.call_tool("find_groups", {"name_prefix": "WA "})
+    assert fake.last_tool_name == "find_groups"
+    assert fake.last_arguments == {
+        "name_prefix": "WA ",
+        "limit": 200,
+        "include_components": False,
+    }
+
+
+async def test_find_groups_forwards_name_pattern(fake: FakeSketchupClient) -> None:
+    async with make_session() as session:
+        await session.call_tool("find_groups", {"name_pattern": r"^Rafter [WE] \d+$"})
+    assert fake.last_arguments == {
+        "name_pattern": r"^Rafter [WE] \d+$",
+        "limit": 200,
+        "include_components": False,
+    }
+
+
+async def test_find_groups_forwards_in_bounds_positive(
+    fake: FakeSketchupClient,
+) -> None:
+    """A typical 'what's near the door RO?' query — bounds intersection.
+    Pinning the exact wire shape protects the Ruby-side parser."""
+    async with make_session() as session:
+        await session.call_tool(
+            "find_groups",
+            {"in_bounds": {"min": [38, 0, 0], "max": [82, 3.5, 95]}},
+        )
+    assert fake.last_arguments == {
+        "in_bounds": {"min": [38, 0, 0], "max": [82, 3.5, 95]},
+        "limit": 200,
+        "include_components": False,
+    }
+
+
+async def test_find_groups_forwards_in_bounds_negative_aabb(
+    fake: FakeSketchupClient,
+) -> None:
+    """A negative-coordinate AABB must round-trip unchanged — bounds are
+    inches in SketchUp's coordinate system and routinely go negative."""
+    async with make_session() as session:
+        await session.call_tool(
+            "find_groups",
+            {"in_bounds": {"min": [-10, -10, -10], "max": [-1, -1, -1]}},
+        )
+    assert fake.last_arguments["in_bounds"] == {
+        "min": [-10, -10, -10],
+        "max": [-1, -1, -1],
+    }
+
+
+async def test_find_groups_forwards_combined_filters(
+    fake: FakeSketchupClient,
+) -> None:
+    async with make_session() as session:
+        await session.call_tool(
+            "find_groups",
+            {
+                "name_prefix": "WA ",
+                "in_bounds": {"min": [0, 0, 0], "max": [100, 100, 100]},
+                "parent_id": 42,
+                "limit": 10,
+                "include_components": True,
+            },
+        )
+    assert fake.last_arguments == {
+        "name_prefix": "WA ",
+        "in_bounds": {"min": [0, 0, 0], "max": [100, 100, 100]},
+        "parent_id": 42,
+        "limit": 10,
+        "include_components": True,
+    }
+
+
+async def test_find_groups_forwards_truncation_limit(
+    fake: FakeSketchupClient,
+) -> None:
+    async with make_session() as session:
+        await session.call_tool("find_groups", {"limit": 5})
+    assert fake.last_arguments["limit"] == 5
+
+
+async def test_find_groups_forwards_include_components(
+    fake: FakeSketchupClient,
+) -> None:
+    async with make_session() as session:
+        await session.call_tool("find_groups", {"include_components": True})
+    assert fake.last_arguments["include_components"] is True
+
+
+async def test_find_groups_omits_unset_filters(fake: FakeSketchupClient) -> None:
+    """A bare call must not leak null filter keys onto the wire — the Ruby
+    side branches on key presence (`params.key?("name_prefix")`)."""
+    async with make_session() as session:
+        await session.call_tool("find_groups", {})
+    assert fake.last_arguments == {"limit": 200, "include_components": False}
+    for key in ("name_prefix", "name_pattern", "in_bounds", "parent_id"):
+        assert key not in fake.last_arguments, f"unset {key} must be omitted"
+
+
+# ---------------------------------------------------------------------------
+# create_extrusion — non-axis-aligned profiles on each axis, reverse-direction
+# extrusion, and the material round-trip. Geometry construction itself lives
+# in Ruby (see su_mcp/test/test_extrusion_helpers.rb); these cases pin the
+# wire shape and confirm that each axis option survives the round trip.
+# ---------------------------------------------------------------------------
+
+
+# Parallelogram side profile of a sloped 2x6 rafter — taken verbatim from
+# the create_extrusion bead's worked example. Vertices are intentionally not
+# axis-aligned (sloped top and bottom edges) so a future refactor that
+# accidentally axis-snaps the profile would break the assertion.
+_RAFTER_PROFILE = [
+    [-12, 89.625],
+    [59.25, 125.25],
+    [59.25, 131.399],
+    [-12, 95.774],
+]
+
+
+async def test_create_extrusion_y_axis_rafter(fake: FakeSketchupClient) -> None:
+    """The canonical use case from the bead: parallelogram profile extruded
+    1.5" along y to make a single rafter."""
+    async with make_session() as session:
+        await session.call_tool(
+            "create_extrusion",
+            {
+                "name": "Rafter W 5",
+                "profile": _RAFTER_PROFILE,
+                "extrude_axis": "y",
+                "extrude_from": 15.25,
+                "extrude_to": 16.75,
+            },
+        )
+    assert fake.last_tool_name == "create_extrusion"
+    assert fake.last_arguments == {
+        "name": "Rafter W 5",
+        "profile": _RAFTER_PROFILE,
+        "extrude_axis": "y",
+        "extrude_from": 15.25,
+        "extrude_to": 16.75,
+    }
+    assert "material" not in fake.last_arguments
+
+
+async def test_create_extrusion_x_axis(fake: FakeSketchupClient) -> None:
+    async with make_session() as session:
+        await session.call_tool(
+            "create_extrusion",
+            {
+                "name": "Header A",
+                "profile": _RAFTER_PROFILE,
+                "extrude_axis": "x",
+                "extrude_from": 0.0,
+                "extrude_to": 3.5,
+            },
+        )
+    assert fake.last_arguments["extrude_axis"] == "x"
+    assert fake.last_arguments["profile"] == _RAFTER_PROFILE
+
+
+async def test_create_extrusion_z_axis(fake: FakeSketchupClient) -> None:
+    async with make_session() as session:
+        await session.call_tool(
+            "create_extrusion",
+            {
+                "name": "Post 1",
+                "profile": _RAFTER_PROFILE,
+                "extrude_axis": "z",
+                "extrude_from": 0.0,
+                "extrude_to": 96.0,
+            },
+        )
+    assert fake.last_arguments["extrude_axis"] == "z"
+
+
+async def test_create_extrusion_reverse_direction(
+    fake: FakeSketchupClient,
+) -> None:
+    """`extrude_to < extrude_from` must round-trip unchanged — Ruby's
+    extrude_direction helper handles the sign. If we sorted these in Python
+    we'd break the "face faces the right way" contract."""
+    async with make_session() as session:
+        await session.call_tool(
+            "create_extrusion",
+            {
+                "name": "Sloped Stud",
+                "profile": _RAFTER_PROFILE,
+                "extrude_axis": "z",
+                "extrude_from": 96.0,
+                "extrude_to": 0.0,
+            },
+        )
+    assert fake.last_arguments["extrude_from"] == 96.0
+    assert fake.last_arguments["extrude_to"] == 0.0
+
+
+async def test_create_extrusion_forwards_material(
+    fake: FakeSketchupClient,
+) -> None:
+    async with make_session() as session:
+        await session.call_tool(
+            "create_extrusion",
+            {
+                "name": "Fascia",
+                "profile": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                "extrude_axis": "y",
+                "extrude_from": 0,
+                "extrude_to": 100,
+                "material": "#8B4513",
+            },
+        )
+    assert fake.last_arguments["material"] == "#8B4513"
+
+
+async def test_create_extrusion_omits_unset_material(
+    fake: FakeSketchupClient,
+) -> None:
+    async with make_session() as session:
+        await session.call_tool(
+            "create_extrusion",
+            {
+                "name": "Fascia",
+                "profile": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                "extrude_axis": "y",
+                "extrude_from": 0,
+                "extrude_to": 100,
+            },
+        )
+    assert "material" not in fake.last_arguments
+
+
+# ---------------------------------------------------------------------------
+# batch_create — wire-shape tests. Per-op dispatch and the start/commit/abort
+# transaction logic live in Ruby (see su_mcp/test/test_batch_create.rb).
+# These tests confirm the Python tool faithfully forwards `operations` and
+# `transaction_name`, and that a failure envelope round-trips with the
+# message the Ruby side raises after aborting.
+# ---------------------------------------------------------------------------
+
+
+async def test_batch_create_forwards_mixed_ops(fake: FakeSketchupClient) -> None:
+    """A realistic batch: a couple of creates, a relative translate, an
+    absolute move_to, and a delete. All five op shapes must round-trip
+    unchanged so the Ruby dispatcher sees what the caller wrote."""
+    ops = [
+        {
+            "op": "cube",
+            "name": "Foundation Block 1",
+            "position": [0, 0, 0],
+            "dimensions": [16, 16, 8],
+        },
+        {
+            "op": "cylinder",
+            "name": "Post 1",
+            "position": [10, 10, 0],
+            "radius": 1.75,
+            "height": 96,
+        },
+        {"op": "translate", "id_or_name": 42, "delta": [0, 0, 1.5]},
+        {"op": "move_to", "id_or_name": "Ridge", "target": [0, 0, 96]},
+        {"op": "delete", "id_or_name": 99},
+    ]
+    async with make_session() as session:
+        await session.call_tool(
+            "batch_create", {"operations": ops, "transaction_name": "Foundation pass"}
+        )
+    assert fake.last_tool_name == "batch_create"
+    assert fake.last_arguments == {
+        "transaction_name": "Foundation pass",
+        "operations": ops,
+    }
+
+
+async def test_batch_create_defaults_transaction_name(
+    fake: FakeSketchupClient,
+) -> None:
+    async with make_session() as session:
+        await session.call_tool(
+            "batch_create",
+            {
+                "operations": [
+                    {
+                        "op": "sphere",
+                        "name": "Ball",
+                        "position": [0, 0, 0],
+                        "radius": 1,
+                    }
+                ]
+            },
+        )
+    assert fake.last_arguments["transaction_name"] == "MCP batch"
+
+
+async def test_batch_create_name_based_mutates_round_trip(
+    fake: FakeSketchupClient,
+) -> None:
+    """Name-based references for mutates and deletes are the headline win of
+    composing batch_create with find_groups — make sure strings stay strings."""
+    ops = [
+        {"op": "translate", "id_or_name": "Rafter W 5", "delta": [0, 0, 0.5]},
+        {"op": "delete", "id_or_name": "Old Rafter"},
+    ]
+    async with make_session() as session:
+        await session.call_tool("batch_create", {"operations": ops})
+    forwarded = fake.last_arguments["operations"]
+    assert forwarded[0]["id_or_name"] == "Rafter W 5"
+    assert isinstance(forwarded[0]["id_or_name"], str)
+    assert forwarded[1]["id_or_name"] == "Old Rafter"
+    assert isinstance(forwarded[1]["id_or_name"], str)
+
+
+async def test_batch_create_forwards_extrusion_op(fake: FakeSketchupClient) -> None:
+    """Extrusion params include a nested list (profile) and floats —
+    confirm the whole shape round-trips."""
+    extrusion_op = {
+        "op": "extrusion",
+        "name": "Rafter W 1",
+        "profile": [
+            [-12, 89.625],
+            [59.25, 125.25],
+            [59.25, 131.399],
+            [-12, 95.774],
+        ],
+        "extrude_axis": "y",
+        "extrude_from": 0.0,
+        "extrude_to": 1.5,
+    }
+    async with make_session() as session:
+        await session.call_tool("batch_create", {"operations": [extrusion_op]})
+    assert fake.last_arguments["operations"][0] == extrusion_op
+
+
+async def test_batch_create_failure_envelope_round_trip(
+    fake: FakeSketchupClient,
+) -> None:
+    """When the Ruby side aborts the transaction and raises, the error message
+    must surface intact in the failure envelope. The Ruby-side rollback itself
+    is covered by su_mcp/test/test_batch_create.rb."""
+    fake.next_error = RuntimeError(
+        'batch_create operation #2 ("cube") failed: bad face. Aborted; 2 prior op(s) rolled back.'
+    )
+    async with make_session() as session:
+        result = await session.call_tool(
+            "batch_create",
+            {
+                "operations": [
+                    {"op": "cube", "name": "A", "position": [0, 0, 0], "dimensions": [1, 1, 1]},
+                    {"op": "cube", "name": "B", "position": [2, 0, 0], "dimensions": [1, 1, 1]},
+                    {"op": "cube", "name": "C", "position": [4, 0, 0], "dimensions": [1, 1, 1]},
+                ]
+            },
+        )
+    env = envelope(result)
+    assert env["success"] is False
+    assert env["result"] is None
+    assert "operation #2" in env["error"]
+    assert "rolled back" in env["error"]
+
+
+async def test_batch_create_preserves_op_order(fake: FakeSketchupClient) -> None:
+    """Order matters — a later move_to depends on an earlier create. Don't
+    let any future "optimization" reorder the operations array."""
+    ops = [
+        {"op": "cube", "name": "First", "position": [0, 0, 0], "dimensions": [1, 1, 1]},
+        {"op": "cube", "name": "Second", "position": [2, 0, 0], "dimensions": [1, 1, 1]},
+        {"op": "cube", "name": "Third", "position": [4, 0, 0], "dimensions": [1, 1, 1]},
+    ]
+    async with make_session() as session:
+        await session.call_tool("batch_create", {"operations": ops})
+    forwarded = fake.last_arguments["operations"]
+    assert [op["name"] for op in forwarded] == ["First", "Second", "Third"]

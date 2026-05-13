@@ -15,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger("SketchupMCPServer")
 
 # Define version directly to avoid pkg_resources dependency
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
 
 
@@ -190,21 +190,35 @@ def create_component(
 
 
 @mcp.tool()
-def delete_component(ctx: Context, id: str) -> str:
-    """Delete a component by ID"""
-    return _call_sketchup(ctx, "delete_component", {"id": id})
+def delete_component(ctx: Context, id: str | None = None, name: str | None = None) -> str:
+    """Delete a component by entity ID or top-level group name.
+
+    Provide exactly one of `id` (entity ID, as returned by create_*) or
+    `name` (exact match against a top-level Group's name). Name lookup
+    errors if zero or multiple groups match.
+    """
+    arguments: dict[str, Any] = {}
+    if id is not None:
+        arguments["id"] = id
+    if name is not None:
+        arguments["name"] = name
+    return _call_sketchup(ctx, "delete_component", arguments)
 
 
 @mcp.tool()
 def transform_component(
     ctx: Context,
-    id: str,
+    id: str | None = None,
+    name: str | None = None,
     move_to: list[float] | None = None,
     position: list[float] | None = None,
     rotation: list[float] | None = None,
     scale: list[float] | None = None,
 ) -> str:
     """Transform a component's placement.
+
+    Provide exactly one of `id` (entity ID) or `name` (exact match against a
+    top-level Group's name). Name lookup errors if zero or multiple groups match.
 
     move_to: absolute XYZ (inches) — translates the entity so its bounds.min
         lands at the given point. Use this for "place at" operations.
@@ -213,7 +227,11 @@ def transform_component(
     rotation: degrees about the entity's bounds-center, applied X then Y then Z.
     scale: per-axis scale factors about the entity's bounds-center.
     """
-    arguments: dict[str, Any] = {"id": id}
+    arguments: dict[str, Any] = {}
+    if id is not None:
+        arguments["id"] = id
+    if name is not None:
+        arguments["name"] = name
     if move_to is not None:
         arguments["move_to"] = move_to
     if position is not None:
@@ -223,6 +241,136 @@ def transform_component(
     if scale is not None:
         arguments["scale"] = scale
     return _call_sketchup(ctx, "transform_component", arguments)
+
+
+@mcp.tool()
+def batch_create(
+    ctx: Context,
+    operations: list[dict[str, Any]],
+    transaction_name: str = "MCP batch",
+) -> str:
+    """Run many create / mutate / delete operations as a single SketchUp transaction.
+
+    All operations execute inside one `model.start_operation` / `commit_operation`
+    pair, so the whole batch is a single undo step. If any operation fails the
+    transaction is rolled back via `model.abort_operation` — there is no partial
+    state in the model. The error response identifies which operation failed.
+
+    Each item in `operations` is a dict with an `op` key picking the action:
+
+    Creates (return `{id, name, bounds}`):
+      - `{"op": "cube",      "name", "position": [x,y,z], "dimensions": [dx,dy,dz], "material"?}`
+      - `{"op": "cylinder",  "name", "position", "radius", "height", "material"?}`
+      - `{"op": "sphere",    "name", "position", "radius",            "material"?}`
+      - `{"op": "cone",      "name", "position", "radius", "height", "material"?}`
+      - `{"op": "extrusion", "name", "profile", "extrude_axis", "extrude_from",
+                                     "extrude_to", "material"?}`
+
+    Mutations (return `{id, bounds}`):
+      - `{"op": "translate", "id_or_name", "delta":  [dx, dy, dz]}` — relative
+      - `{"op": "move_to",   "id_or_name", "target": [x,  y,  z]}` — absolute,
+        anchors `bounds.min` to `target` (same semantics as
+        `transform_component`'s `move_to`).
+
+    Deletes (return `{id}`):
+      - `{"op": "delete", "id_or_name"}`
+
+    `id_or_name` is an integer entityID or a string group name. A name that
+    matches multiple groups errors — no ambiguous targets.
+
+    operations: ordered list of operation dicts.
+    transaction_name: label for SketchUp's undo stack (default "MCP batch").
+
+    Returns `{success, results: [...], count}` with results in input order.
+    """
+    return _call_sketchup(
+        ctx,
+        "batch_create",
+        {"transaction_name": transaction_name, "operations": operations},
+    )
+
+
+@mcp.tool()
+def create_extrusion(
+    ctx: Context,
+    name: str,
+    profile: list[list[float]],
+    extrude_axis: str,
+    extrude_from: float,
+    extrude_to: float,
+    material: str | None = None,
+) -> str:
+    """Create a Group from a 2D profile extruded along the given axis.
+
+    The 2D profile is interpreted in the plane perpendicular to `extrude_axis`:
+
+    - `"x"`: each `[a, b]` is `[y, z]`; face sits at `x=extrude_from`.
+    - `"y"`: each `[a, b]` is `[x, z]`; face sits at `y=extrude_from`.
+    - `"z"`: each `[a, b]` is `[x, y]`; face sits at `z=extrude_from`.
+
+    Vertex winding (CW vs CCW) doesn't matter — face direction is chosen
+    from the requested extrude direction, not from the right-hand rule.
+    `extrude_to` may be less than `extrude_from`; sign drives direction.
+    The polygon is closed automatically (don't repeat the first vertex).
+
+    name: name assigned to the resulting Group.
+    profile: ordered 2D vertices, length >= 3.
+    extrude_axis: "x", "y", or "z".
+    extrude_from: coordinate of the profile face on the extrusion axis.
+    extrude_to: coordinate where the extrusion ends.
+    material: optional name or "#RRGGBB" hex applied to the resulting group.
+
+    Returns `{id, bounds: {min, max}, success}` — same shape as create_component.
+    """
+    arguments: dict[str, Any] = {
+        "name": name,
+        "profile": profile,
+        "extrude_axis": extrude_axis,
+        "extrude_from": extrude_from,
+        "extrude_to": extrude_to,
+    }
+    if material is not None:
+        arguments["material"] = material
+    return _call_sketchup(ctx, "create_extrusion", arguments)
+
+
+@mcp.tool()
+def find_groups(
+    ctx: Context,
+    name_prefix: str | None = None,
+    name_pattern: str | None = None,
+    in_bounds: dict[str, list[float]] | None = None,
+    parent_id: int | None = None,
+    limit: int = 200,
+    include_components: bool = False,
+) -> str:
+    """Query existing groups in the active model.
+
+    All filters combine with AND. Returns a list of matches, each with
+    `{id, name, bounds: {min, max}, layer, material}`, plus a `truncated`
+    flag indicating whether the `limit` cap was hit.
+
+    name_prefix: match groups whose name starts with this prefix.
+    name_pattern: Ruby regex (as a string) matched against the group name.
+        Mutually exclusive with `name_prefix`.
+    in_bounds: {"min": [x,y,z], "max": [x,y,z]} (inches). Match groups whose
+        bounds *intersect* this AABB — not strict containment.
+    parent_id: restrict to children of a specific group (nested models).
+        Top-level entities are searched if omitted. Non-group IDs error.
+    limit: hard cap on results (default 200). `truncated: true` if reached.
+    include_components: also include `Sketchup::ComponentInstance` (default
+        is Groups only, matching this project's convention).
+    """
+    arguments: dict[str, Any] = {"limit": limit, "include_components": include_components}
+    if name_prefix is not None:
+        arguments["name_prefix"] = name_prefix
+    if name_pattern is not None:
+        arguments["name_pattern"] = name_pattern
+    if in_bounds is not None:
+        arguments["in_bounds"] = in_bounds
+    if parent_id is not None:
+        arguments["parent_id"] = parent_id
+    return _call_sketchup(ctx, "find_groups", arguments)
 
 
 @mcp.tool()

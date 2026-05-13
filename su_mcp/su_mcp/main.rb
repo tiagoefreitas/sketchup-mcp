@@ -213,17 +213,25 @@ module SU_MCP
 
     def handle_tool_call(request)
       log "Handling tool call: #{request.inspect}"
-      tool_name = request["params"]["name"]
-      args = request["params"]["arguments"]
 
       begin
+        params = request["params"] or raise "tools/call request is missing 'params'"
+        tool_name = params["name"]
+        args = params["arguments"]
+
         result = case tool_name
         when "create_component"
           create_component(args)
+        when "create_extrusion"
+          create_extrusion(args)
+        when "batch_create"
+          batch_create(args)
         when "delete_component"
           delete_component(args)
         when "transform_component"
           transform_component(args)
+        when "find_groups"
+          find_groups(args)
         when "get_selection"
           get_selection
         when "export", "export_scene"
@@ -504,104 +512,401 @@ module SU_MCP
       end
     end
 
-    def delete_component(params)
+    def create_extrusion(params)
+      log "create_extrusion params: #{params.inspect}"
+
+      name = params["name"].to_s
+      profile = params["profile"]
+      axis = params["extrude_axis"].to_s
+      from = params["extrude_from"]
+      to = params["extrude_to"]
+
+      raise "'name' is required" if name.empty?
+      unless profile.is_a?(Array) && profile.length >= 3
+        raise "'profile' must be an array of at least 3 [a, b] vertices"
+      end
+      unless %w[x y z].include?(axis)
+        raise "'extrude_axis' must be one of 'x', 'y', 'z' (got #{params["extrude_axis"].inspect})"
+      end
+      unless from.is_a?(Numeric) && to.is_a?(Numeric)
+        raise "'extrude_from' and 'extrude_to' must be numbers"
+      end
+      raise "'extrude_from' and 'extrude_to' must differ" if from == to
+
+      point_tuples = build_profile_points(profile, axis, from.to_f)
+      points = point_tuples.map { |x, y, z| Geom::Point3d.new(x, y, z) }
+      dx, dy, dz = extrude_direction(axis, from.to_f, to.to_f)
+      desired = Geom::Vector3d.new(dx, dy, dz)
+
       model = Sketchup.active_model
-      
-      # Handle ID format - strip quotes if present
-      id_str = params["id"].to_s.gsub('"', '')
-      log "Looking for entity with ID: #{id_str}"
-      
-      entity = model.find_entity_by_id(id_str.to_i)
-      
-      if entity
-        log "Found entity: #{entity.inspect}"
-        entity.erase!
-        { success: true }
-      else
-        raise "Entity not found"
+      group = model.active_entities.add_group
+      group.name = name
+
+      face = group.entities.add_face(points)
+      # Generalization of the cube-branch face.reverse! guard: pushpull
+      # extrudes along the face's *front* normal, so flip the face when its
+      # normal disagrees with the direction the caller asked for. This is
+      # what makes vertex-winding irrelevant from the caller's point of view.
+      face.reverse! if face.normal.dot(desired) < 0
+      face.pushpull((to - from).abs)
+
+      apply_material(group, params["material"]) if params["material"]
+
+      bounds_result(group)
+    end
+
+    # Pure: map a 2D profile + fixed-axis coordinate into [x, y, z] tuples.
+    # The axis names the *extrude* direction, so the profile lives in the
+    # plane perpendicular to it.
+    def build_profile_points(profile, axis, fixed)
+      fixed = fixed.to_f
+      profile.map do |pair|
+        a = pair[0].to_f
+        b = pair[1].to_f
+        case axis.to_s
+        when "x" then [fixed, a, b]
+        when "y" then [a, fixed, b]
+        when "z" then [a, b, fixed]
+        end
       end
     end
 
-    def transform_component(params)
-      model = Sketchup.active_model
-      
-      # Handle ID format - strip quotes if present
-      id_str = params["id"].to_s.gsub('"', '')
-      log "Looking for entity with ID: #{id_str}"
-      
-      entity = model.find_entity_by_id(id_str.to_i)
-      
-      if entity
-        log "Found entity: #{entity.inspect}"
-
-        # `move_to` places the entity so its bounds.min lands at the given XYZ.
-        # This is the obvious "put this here" semantic — distinct from `position`,
-        # which is a relative delta and is preserved for backwards compatibility.
-        if params["move_to"]
-          target = params["move_to"]
-          current_min = entity.bounds.min
-          delta = Geom::Vector3d.new(
-            target[0] - current_min.x,
-            target[1] - current_min.y,
-            target[2] - current_min.z
-          )
-          log "Moving bounds.min from #{[current_min.x.to_f, current_min.y.to_f, current_min.z.to_f].inspect} to #{target.inspect}"
-          entity.transform!(Geom::Transformation.translation(delta))
-        end
-
-        # `position` is a relative translation applied on top of the entity's
-        # current transform. Passing [0,0,0] is a no-op. Use `move_to` for
-        # absolute placement.
-        if params["position"]
-          pos = params["position"]
-          log "Translating by #{pos.inspect} (relative)"
-
-          translation = Geom::Transformation.translation(Geom::Point3d.new(pos[0], pos[1], pos[2]))
-          entity.transform!(translation)
-        end
-        
-        # Handle rotation (in degrees)
-        if params["rotation"]
-          rot = params["rotation"]
-          log "Rotating by #{rot.inspect} degrees"
-          
-          # Convert to radians
-          x_rot = rot[0] * Math::PI / 180
-          y_rot = rot[1] * Math::PI / 180
-          z_rot = rot[2] * Math::PI / 180
-          
-          # Apply rotations
-          if rot[0] != 0
-            rotation = Geom::Transformation.rotation(entity.bounds.center, Geom::Vector3d.new(1, 0, 0), x_rot)
-            entity.transform!(rotation)
-          end
-          
-          if rot[1] != 0
-            rotation = Geom::Transformation.rotation(entity.bounds.center, Geom::Vector3d.new(0, 1, 0), y_rot)
-            entity.transform!(rotation)
-          end
-          
-          if rot[2] != 0
-            rotation = Geom::Transformation.rotation(entity.bounds.center, Geom::Vector3d.new(0, 0, 1), z_rot)
-            entity.transform!(rotation)
-          end
-        end
-        
-        # Handle scale
-        if params["scale"]
-          scale = params["scale"]
-          log "Scaling by #{scale.inspect}"
-          
-          # Create a transformation to scale the entity
-          center = entity.bounds.center
-          scaling = Geom::Transformation.scaling(center, scale[0], scale[1], scale[2])
-          entity.transform!(scaling)
-        end
-
-        bounds_result(entity)
-      else
-        raise "Entity not found"
+    # Pure: unit vector along `axis` pointing from `from` toward `to`. Used
+    # to decide whether to flip the face so pushpull extrudes the right way.
+    def extrude_direction(axis, from, to)
+      sign = (to - from) > 0 ? 1.0 : -1.0
+      case axis.to_s
+      when "x" then [sign, 0.0, 0.0]
+      when "y" then [0.0, sign, 0.0]
+      when "z" then [0.0, 0.0, sign]
       end
+    end
+
+    # Reuse the existing set_material path so name/hex resolution and color
+    # defaults stay in one place. set_material accepts the same `id` format
+    # the dispatcher already strips.
+    def apply_material(group, material_name)
+      set_material({ "id" => group.entityID, "material" => material_name })
+    end
+
+    KNOWN_BATCH_OPS = %w[cube cylinder sphere cone extrusion translate move_to delete].freeze
+
+    # Run many create / mutate / delete ops as a single SketchUp transaction.
+    # The whole batch is one undo step. Any exception during dispatch aborts
+    # the transaction (model.abort_operation) and re-raises with the failing
+    # op's index, so the caller sees the model unchanged.
+    def batch_create(params)
+      operations = params["operations"]
+      raise "'operations' must be an array" unless operations.is_a?(Array)
+      operations.each_with_index { |op, i| validate_batch_op(op, i) }
+
+      transaction_name = (params["transaction_name"] || "MCP batch").to_s
+      model = Sketchup.active_model
+      results = []
+      failed_index = nil
+      failed_op = nil
+
+      model.start_operation(transaction_name, true)
+      begin
+        operations.each_with_index do |op, i|
+          failed_index = i
+          failed_op = op
+          results << execute_batch_op(op)
+        end
+        failed_index = nil
+        model.commit_operation
+      rescue StandardError => e
+        model.abort_operation
+        completed = results.length
+        raise "batch_create operation ##{failed_index} (#{failed_op["op"].inspect}) failed: #{e.message}. Aborted; #{completed} prior op(s) rolled back."
+      end
+
+      { success: true, count: results.length, results: results }
+    end
+
+    def validate_batch_op(op, index)
+      raise "operation ##{index} must be a Hash, got #{op.class}" unless op.is_a?(Hash)
+      op_name = op["op"].to_s
+      unless KNOWN_BATCH_OPS.include?(op_name)
+        raise "operation ##{index} has unknown op #{op["op"].inspect} (expected one of: #{KNOWN_BATCH_OPS.join(', ')})"
+      end
+    end
+
+    def execute_batch_op(op)
+      case op["op"].to_s
+      when "cube", "cylinder", "sphere", "cone"
+        create_named_primitive(op)
+      when "extrusion"
+        extrusion_params = {
+          "name" => op["name"],
+          "profile" => op["profile"],
+          "extrude_axis" => op["extrude_axis"],
+          "extrude_from" => op["extrude_from"],
+          "extrude_to" => op["extrude_to"]
+        }
+        extrusion_params["material"] = op["material"] if op["material"]
+        create_extrusion(extrusion_params)
+      when "translate"
+        transform_component(id_or_name_params(op["id_or_name"]).merge("position" => op["delta"]))
+      when "move_to"
+        transform_component(id_or_name_params(op["id_or_name"]).merge("move_to" => op["target"]))
+      when "delete"
+        entity = resolve_entity(id_or_name_params(op["id_or_name"]))
+        id = entity.entityID
+        entity.erase!
+        { id: id, success: true }
+      else
+        # validate_batch_op already screened this; defensive only.
+        raise "Unknown batch op: #{op["op"].inspect}"
+      end
+    end
+
+    # Build a transform_component / delete_component params hash from a raw
+    # `id_or_name` value. Integer → id; String → name. Strict: a numeric
+    # string is still treated as a name, so the integer-vs-string distinction
+    # is what selects the lookup mode (per the bead's contract).
+    def id_or_name_params(raw)
+      case raw
+      when Integer then { "id" => raw }
+      when String then { "name" => raw }
+      else
+        raise "id_or_name must be an Integer (entityID) or String (group name), got #{raw.class}"
+      end
+    end
+
+    # Compute the dimensions array that create_component's per-shape code
+    # expects, from the more natural radius/height batch-op parameterization.
+    def primitive_dimensions(op)
+      case op["op"].to_s
+      when "cube"
+        op["dimensions"]
+      when "cylinder", "cone"
+        r = op["radius"].to_f
+        [r * 2, r * 2, op["height"].to_f]
+      when "sphere"
+        r = op["radius"].to_f
+        [r * 2, r * 2, r * 2]
+      end
+    end
+
+    def create_named_primitive(op)
+      result = create_component({
+        "type" => op["op"].to_s,
+        "position" => op["position"],
+        "dimensions" => primitive_dimensions(op)
+      })
+      # create_component returns the new group's entityID; look it up so we
+      # can name it and apply material before reporting bounds.
+      group = Sketchup.active_model.find_entity_by_id(result[:id])
+      group.name = op["name"].to_s if op["name"]
+      apply_material(group, op["material"]) if op["material"]
+      out = bounds_result(group)
+      out[:name] = group.name
+      out
+    end
+
+    # Resolve an entity from `params` by either `id` (entity ID) or `name`
+    # (exact match against a top-level Group's name). Exactly one must be
+    # provided. Name resolution is strict: zero or multiple matches raise.
+    # Shared by delete_component, transform_component, and (later) batch_create.
+    def resolve_entity(params, model = Sketchup.active_model)
+      has_id = params.key?("id") && !params["id"].nil? && params["id"].to_s != ""
+      has_name = params.key?("name") && !params["name"].nil? && params["name"].to_s != ""
+
+      raise "Provide exactly one of 'id' or 'name', not both" if has_id && has_name
+      raise "Provide exactly one of 'id' or 'name'" unless has_id || has_name
+
+      if has_id
+        id_str = params["id"].to_s.gsub('"', '')
+        log "Resolving entity by ID: #{id_str}"
+        entity = model.find_entity_by_id(id_str.to_i)
+        raise "Entity not found: #{id_str}" unless entity
+        entity
+      else
+        name = params["name"].to_s
+        log "Resolving entity by name: #{name.inspect}"
+        matches = model.entities.grep(Sketchup::Group).select { |g| g.name == name }
+        raise "No group found with name #{name.inspect}" if matches.empty?
+        if matches.length > 1
+          ids = matches.map(&:entityID)
+          raise "Multiple groups match name #{name.inspect} (IDs: #{ids.inspect})"
+        end
+        matches.first
+      end
+    end
+
+    def delete_component(params)
+      entity = resolve_entity(params)
+      log "Found entity: #{entity.inspect}"
+      entity.erase!
+      { success: true }
+    end
+
+    def transform_component(params)
+      entity = resolve_entity(params)
+      log "Found entity: #{entity.inspect}"
+
+      # `move_to` places the entity so its bounds.min lands at the given XYZ.
+      # This is the obvious "put this here" semantic — distinct from `position`,
+      # which is a relative delta and is preserved for backwards compatibility.
+      if params["move_to"]
+        target = params["move_to"]
+        current_min = entity.bounds.min
+        delta = Geom::Vector3d.new(
+          target[0] - current_min.x,
+          target[1] - current_min.y,
+          target[2] - current_min.z
+        )
+        log "Moving bounds.min from #{[current_min.x.to_f, current_min.y.to_f, current_min.z.to_f].inspect} to #{target.inspect}"
+        entity.transform!(Geom::Transformation.translation(delta))
+      end
+
+      # `position` is a relative translation applied on top of the entity's
+      # current transform. Passing [0,0,0] is a no-op. Use `move_to` for
+      # absolute placement.
+      if params["position"]
+        pos = params["position"]
+        log "Translating by #{pos.inspect} (relative)"
+
+        translation = Geom::Transformation.translation(Geom::Point3d.new(pos[0], pos[1], pos[2]))
+        entity.transform!(translation)
+      end
+
+      # Handle rotation (in degrees)
+      if params["rotation"]
+        rot = params["rotation"]
+        log "Rotating by #{rot.inspect} degrees"
+
+        # Convert to radians
+        x_rot = rot[0] * Math::PI / 180
+        y_rot = rot[1] * Math::PI / 180
+        z_rot = rot[2] * Math::PI / 180
+
+        # Apply rotations
+        if rot[0] != 0
+          rotation = Geom::Transformation.rotation(entity.bounds.center, Geom::Vector3d.new(1, 0, 0), x_rot)
+          entity.transform!(rotation)
+        end
+
+        if rot[1] != 0
+          rotation = Geom::Transformation.rotation(entity.bounds.center, Geom::Vector3d.new(0, 1, 0), y_rot)
+          entity.transform!(rotation)
+        end
+
+        if rot[2] != 0
+          rotation = Geom::Transformation.rotation(entity.bounds.center, Geom::Vector3d.new(0, 0, 1), z_rot)
+          entity.transform!(rotation)
+        end
+      end
+
+      # Handle scale
+      if params["scale"]
+        scale = params["scale"]
+        log "Scaling by #{scale.inspect}"
+
+        # Create a transformation to scale the entity
+        center = entity.bounds.center
+        scaling = Geom::Transformation.scaling(center, scale[0], scale[1], scale[2])
+        entity.transform!(scaling)
+      end
+
+      bounds_result(entity)
+    end
+
+    def find_groups(params)
+      log "find_groups params: #{params.inspect}"
+
+      has_prefix = params.key?("name_prefix") && !params["name_prefix"].nil?
+      has_pattern = params.key?("name_pattern") && !params["name_pattern"].nil?
+      raise "Provide at most one of 'name_prefix' or 'name_pattern'" if has_prefix && has_pattern
+
+      prefix = has_prefix ? params["name_prefix"].to_s : nil
+      pattern = has_pattern ? Regexp.new(params["name_pattern"].to_s) : nil
+      in_bounds = params["in_bounds"]
+      limit = (params["limit"] || 200).to_i
+      include_components = params["include_components"] ? true : false
+
+      model = Sketchup.active_model
+      entities = resolve_search_root(model, params["parent_id"])
+
+      matched = []
+      truncated = false
+      entities.each do |entity|
+        next unless entity_matches_kind?(entity, include_components)
+        next unless name_matches?(entity.name, prefix, pattern)
+        next unless bounds_matches?(entity.bounds, in_bounds)
+
+        if matched.length >= limit
+          truncated = true
+          break
+        end
+        matched << describe_match(entity)
+      end
+
+      { success: true, groups: matched, truncated: truncated }
+    end
+
+    def resolve_search_root(model, parent_id)
+      return model.entities if parent_id.nil?
+
+      parent = model.find_entity_by_id(parent_id.to_i)
+      raise "Entity not found: #{parent_id}" unless parent
+      unless parent.is_a?(Sketchup::Group)
+        raise "parent_id #{parent_id} is not a Group (got #{parent.class})"
+      end
+      parent.entities
+    end
+
+    # Pure: does `entity` count as a hit given the kind filter? Groups
+    # always do; ComponentInstances only when explicitly opted in.
+    def entity_matches_kind?(entity, include_components)
+      return true if entity.is_a?(Sketchup::Group)
+      return true if include_components && entity.is_a?(Sketchup::ComponentInstance)
+      false
+    end
+
+    # Pure: name passes if either no filter, prefix matches, or regex matches.
+    # prefix and pattern are mutually exclusive at the caller — passing both
+    # would be a caller bug, not handled here.
+    def name_matches?(name, prefix, pattern)
+      return name.to_s.start_with?(prefix) if prefix
+      return pattern.match?(name.to_s) if pattern
+      true
+    end
+
+    # Pure AABB intersection: two boxes intersect iff they overlap on every
+    # axis. `in_bounds` is the query box ({"min": [x,y,z], "max": [x,y,z]});
+    # `entity_bounds` exposes .min and .max as objects with .x/.y/.z.
+    # Touch-only contact (max == min on an axis) counts as intersecting —
+    # consistent with SketchUp's own BoundingBox#intersect.
+    def bounds_matches?(entity_bounds, in_bounds)
+      return true if in_bounds.nil?
+
+      qmin = in_bounds["min"]
+      qmax = in_bounds["max"]
+      emin = entity_bounds.min
+      emax = entity_bounds.max
+      return false if emax.x < qmin[0] || emin.x > qmax[0]
+      return false if emax.y < qmin[1] || emin.y > qmax[1]
+      return false if emax.z < qmin[2] || emin.z > qmax[2]
+      true
+    end
+
+    def describe_match(entity)
+      bmin = entity.bounds.min
+      bmax = entity.bounds.max
+      layer = entity.respond_to?(:layer) && entity.layer ? entity.layer.name : nil
+      material = entity.respond_to?(:material) && entity.material ? entity.material.display_name : nil
+      {
+        id: entity.entityID,
+        name: entity.name,
+        bounds: {
+          min: [bmin.x.to_f, bmin.y.to_f, bmin.z.to_f],
+          max: [bmax.x.to_f, bmax.y.to_f, bmax.z.to_f]
+        },
+        layer: layer,
+        material: material
+      }
     end
 
     def get_selection
@@ -1319,9 +1624,6 @@ module SU_MCP
     end
     
     def determine_closest_face(direction_vector)
-      # Normalize the direction vector
-      direction_vector.normalize!
-      
       # Determine which axis has the largest component
       x_abs = direction_vector.x.abs
       y_abs = direction_vector.y.abs
@@ -1507,6 +1809,8 @@ module SU_MCP
           bounds.center.y - height/2 + offset_y,
           bounds.min.z
         ]
+      else
+        raise ArgumentError, "Unknown face_direction: #{face_direction.inspect}"
       end
     end
     
