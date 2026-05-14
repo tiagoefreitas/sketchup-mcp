@@ -92,6 +92,7 @@ async def test_every_tool_is_registered(fake: FakeSketchupClient) -> None:
     names = {t.name for t in listed.tools}
     assert names == {
         "batch_create",
+        "boolean_op",
         "create_component",
         "create_extrusion",
         "delete_component",
@@ -524,6 +525,114 @@ async def test_find_groups_omits_unset_filters(fake: FakeSketchupClient) -> None
     assert fake.last_arguments == {"limit": 200, "include_components": False}
     for key in ("name_prefix", "name_pattern", "in_bounds", "parent_id"):
         assert key not in fake.last_arguments, f"unset {key} must be omitted"
+
+
+async def test_find_groups_returns_structured_payload(fake: FakeSketchupClient) -> None:
+    """Regression for sch-wqb: find_groups must surface the structured
+    {groups, truncated} payload rather than collapsing to 'Success'. The Ruby
+    handler now merges its extra keys into the JSON-RPC result, so the fake
+    mirrors that shape (the wrapper fields plus groups/truncated)."""
+    sample = [
+        {
+            "id": 101,
+            "name": "Rafter W 1",
+            "bounds": {"min": [0.0, 0.0, 0.0], "max": [1.5, 96.0, 5.5]},
+            "layer": "Layer0",
+            "material": None,
+        },
+        {
+            "id": 102,
+            "name": "Rafter W 2",
+            "bounds": {"min": [16.0, 0.0, 0.0], "max": [17.5, 96.0, 5.5]},
+            "layer": "Layer0",
+            "material": "Cherry",
+        },
+    ]
+    fake.next_result = {
+        "content": [{"type": "text", "text": "Success"}],
+        "isError": False,
+        "success": True,
+        "resourceId": None,
+        "groups": sample,
+        "truncated": False,
+    }
+    async with make_session() as session:
+        result = await session.call_tool("find_groups", {"name_prefix": "Rafter W"})
+    assert envelope(result) == {
+        "success": True,
+        "result": {"groups": sample, "truncated": False},
+        "error": None,
+    }
+
+
+async def test_find_groups_returns_empty_list_when_no_matches(
+    fake: FakeSketchupClient,
+) -> None:
+    """No matches must surface as an empty list, not the literal 'Success'."""
+    fake.next_result = {
+        "content": [{"type": "text", "text": "Success"}],
+        "isError": False,
+        "success": True,
+        "resourceId": None,
+        "groups": [],
+        "truncated": False,
+    }
+    async with make_session() as session:
+        result = await session.call_tool("find_groups", {})
+    assert envelope(result) == {
+        "success": True,
+        "result": {"groups": [], "truncated": False},
+        "error": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# boolean_op — Pin the wire shape for the SU Pro Solid Tools wrapper. The
+# operation itself is delegated to Sketchup::Group#union/subtract/intersect/
+# outer_shell on the Ruby side and can't run without SketchUp.
+# ---------------------------------------------------------------------------
+
+
+async def test_boolean_op_forwards_subtract(fake: FakeSketchupClient) -> None:
+    async with make_session() as session:
+        await session.call_tool(
+            "boolean_op",
+            {"operation": "subtract", "target_id": 101, "tool_id": 202},
+        )
+    assert fake.last_tool_name == "boolean_operation"
+    assert fake.last_arguments == {
+        "operation": "subtract",
+        "target_id": 101,
+        "tool_id": 202,
+        "delete_originals": True,
+    }
+
+
+async def test_boolean_op_forwards_keep_originals(fake: FakeSketchupClient) -> None:
+    async with make_session() as session:
+        await session.call_tool(
+            "boolean_op",
+            {
+                "operation": "union",
+                "target_id": 1,
+                "tool_id": 2,
+                "delete_originals": False,
+            },
+        )
+    assert fake.last_arguments["delete_originals"] is False
+
+
+async def test_boolean_op_rejects_unknown_operation(fake: FakeSketchupClient) -> None:
+    """The Literal type on the Python side should reject anything outside the
+    four supported operations before it ever hits the wire."""
+    async with make_session() as session:
+        result = await session.call_tool(
+            "boolean_op",
+            {"operation": "merge", "target_id": 1, "tool_id": 2},
+        )
+    # FastMCP surfaces the validation error; the Ruby side must not have been called.
+    assert fake.calls == []
+    assert result.isError is True
 
 
 # ---------------------------------------------------------------------------
