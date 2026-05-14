@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Resolve version from tag
+        id: version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-].+)?$ ]]; then
+            echo "Tag '$tag' is not a vX.Y.Z release tag" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing version: $version"
+
+      - name: Stamp version into sources
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+
+          version = os.environ["VERSION"]
+
+          pyproject = pathlib.Path("pyproject.toml")
+          pyproject.write_text(
+              re.sub(
+                  r'^version = ".*"$',
+                  f'version = "{version}"',
+                  pyproject.read_text(),
+                  count=1,
+                  flags=re.M,
+              )
+          )
+
+          server = pathlib.Path("src/sketchup_mcp/server.py")
+          server.write_text(
+              re.sub(
+                  r'__version__ = ".*?"',
+                  f'__version__ = "{version}"',
+                  server.read_text(),
+                  count=1,
+              )
+          )
+
+          extension = pathlib.Path("su_mcp/extension.json")
+          data = json.loads(extension.read_text())
+          data["version"] = version
+          extension.write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+
+      - name: Build Python wheel and sdist
+        run: uv build
+
+      - name: Build SketchUp .rbz
+        run: bash scripts/build_rbz.sh
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            dist/*
+            su_mcp_v*.rbz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
