@@ -97,6 +97,8 @@ async def test_every_tool_is_registered(fake: FakeSketchupClient) -> None:
         "delete_component",
         "transform_component",
         "find_groups",
+        "inspect_geometry",
+        "replace_geometry",
         "get_selection",
         "set_material",
         "export_scene",
@@ -654,6 +656,220 @@ async def test_create_extrusion_omits_unset_material(
             },
         )
     assert "material" not in fake.last_arguments
+
+
+async def test_create_extrusion_forwards_holes(fake: FakeSketchupClient) -> None:
+    """`holes` (list of inner 2D polygons) must round-trip unchanged so the
+    Ruby side can turn them into through-cutouts. Validation lives in Ruby."""
+    holes = [
+        [[8.25, 36], [33.25, 36], [33.25, 61], [8.25, 61]],
+        [[40, 40], [44, 40], [44, 44], [40, 44]],
+    ]
+    async with make_session() as session:
+        await session.call_tool(
+            "create_extrusion",
+            {
+                "name": "Siding 1",
+                "profile": [[0, 0], [38, 0], [38, 96], [0, 96]],
+                "extrude_axis": "y",
+                "extrude_from": 0,
+                "extrude_to": 0.5,
+                "holes": holes,
+            },
+        )
+    assert fake.last_arguments["holes"] == holes
+
+
+async def test_create_extrusion_omits_unset_holes(fake: FakeSketchupClient) -> None:
+    async with make_session() as session:
+        await session.call_tool(
+            "create_extrusion",
+            {
+                "name": "Siding 1",
+                "profile": [[0, 0], [38, 0], [38, 96], [0, 96]],
+                "extrude_axis": "y",
+                "extrude_from": 0,
+                "extrude_to": 0.5,
+            },
+        )
+    assert "holes" not in fake.last_arguments
+
+
+async def test_create_extrusion_forwards_plane_and_depth(
+    fake: FakeSketchupClient,
+) -> None:
+    """Arbitrary-plane mode: `plane` (origin + normal) plus `extrude_depth`.
+    Wire-shape only — Ruby owns basis construction and pushpull direction."""
+    async with make_session() as session:
+        await session.call_tool(
+            "create_extrusion",
+            {
+                "name": "Roof Sheathing 1",
+                "profile": [[0, 0], [48, 0], [48, 96], [0, 96]],
+                "plane": {"origin": [0, 0, 0], "normal": [0, -0.4472, 0.8944]},
+                "extrude_depth": 0.625,
+            },
+        )
+    assert fake.last_arguments == {
+        "name": "Roof Sheathing 1",
+        "profile": [[0, 0], [48, 0], [48, 96], [0, 96]],
+        "plane": {"origin": [0, 0, 0], "normal": [0, -0.4472, 0.8944]},
+        "extrude_depth": 0.625,
+    }
+    assert "extrude_axis" not in fake.last_arguments
+
+
+async def test_create_extrusion_omits_axis_keys_when_unset(
+    fake: FakeSketchupClient,
+) -> None:
+    """The Ruby side branches on key presence to pick axis-vs-plane mode.
+    A bare plane-mode call must not leak `extrude_axis` / `extrude_from` /
+    `extrude_to` onto the wire."""
+    async with make_session() as session:
+        await session.call_tool(
+            "create_extrusion",
+            {
+                "name": "Slab",
+                "profile": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                "plane": {"origin": [0, 0, 0], "normal": [0, 0, 1]},
+                "extrude_depth": 1.0,
+            },
+        )
+    for key in ("extrude_axis", "extrude_from", "extrude_to"):
+        assert key not in fake.last_arguments
+
+
+async def test_replace_geometry_forwards_id_and_geometry(
+    fake: FakeSketchupClient,
+) -> None:
+    geometry = {"op": "cube", "position": [0, 0, 0], "dimensions": [16, 16, 8]}
+    async with make_session() as session:
+        await session.call_tool("replace_geometry", {"id": "123", "geometry": geometry})
+    assert fake.last_tool_name == "replace_geometry"
+    assert fake.last_arguments == {
+        "id": "123",
+        "geometry": geometry,
+        "recursive": True,
+    }
+    assert "name" not in fake.last_arguments
+
+
+async def test_replace_geometry_forwards_name(fake: FakeSketchupClient) -> None:
+    geometry = {"op": "cylinder", "position": [0, 0, 0], "radius": 1.5, "height": 96}
+    async with make_session() as session:
+        await session.call_tool("replace_geometry", {"name": "Post 1", "geometry": geometry})
+    assert fake.last_arguments == {
+        "name": "Post 1",
+        "geometry": geometry,
+        "recursive": True,
+    }
+    assert "id" not in fake.last_arguments
+
+
+async def test_replace_geometry_forwards_recursive_false(
+    fake: FakeSketchupClient,
+) -> None:
+    """`recursive: false` is the opt-out for the children-loss guard.
+    It must reach the Ruby side as a literal false, not be coerced or dropped."""
+    geometry = {"op": "cube", "position": [0, 0, 0], "dimensions": [1, 1, 1]}
+    async with make_session() as session:
+        await session.call_tool(
+            "replace_geometry",
+            {"id": "5", "geometry": geometry, "recursive": False},
+        )
+    assert fake.last_arguments["recursive"] is False
+
+
+async def test_replace_geometry_forwards_extrusion_geometry(
+    fake: FakeSketchupClient,
+) -> None:
+    """Extrusion geometry includes nested arrays + floats; pin the wire
+    shape so a future flatten/coerce can't break the round trip."""
+    geometry = {
+        "op": "extrusion",
+        "profile": [[0, 0], [38, 0], [38, 96], [0, 96]],
+        "extrude_axis": "y",
+        "extrude_from": 0,
+        "extrude_to": 0.5,
+        "holes": [[[8.25, 36], [33.25, 36], [33.25, 61], [8.25, 61]]],
+    }
+    async with make_session() as session:
+        await session.call_tool("replace_geometry", {"name": "Siding W1", "geometry": geometry})
+    assert fake.last_arguments["geometry"] == geometry
+
+
+async def test_batch_create_forwards_replace_op(fake: FakeSketchupClient) -> None:
+    """The new `replace` batch op must round-trip with `id_or_name`,
+    `geometry`, and optional `recursive` intact — the headline win is
+    transactional multi-group geometry edits."""
+    ops = [
+        {
+            "op": "replace",
+            "id_or_name": "Siding W1",
+            "geometry": {
+                "op": "extrusion",
+                "profile": [[0, 0], [38, 0], [38, 96], [0, 96]],
+                "extrude_axis": "y",
+                "extrude_from": 0,
+                "extrude_to": 0.5,
+            },
+            "recursive": False,
+        },
+    ]
+    async with make_session() as session:
+        await session.call_tool("batch_create", {"operations": ops})
+    assert fake.last_arguments["operations"] == ops
+
+
+async def test_inspect_geometry_forwards_id(fake: FakeSketchupClient) -> None:
+    async with make_session() as session:
+        await session.call_tool("inspect_geometry", {"id": "123"})
+    assert fake.last_tool_name == "inspect_geometry"
+    assert fake.last_arguments == {"id": "123", "include_vertices": True}
+    assert "name" not in fake.last_arguments
+
+
+async def test_inspect_geometry_forwards_name(fake: FakeSketchupClient) -> None:
+    async with make_session() as session:
+        await session.call_tool("inspect_geometry", {"name": "WA Siding 1"})
+    assert fake.last_arguments == {"name": "WA Siding 1", "include_vertices": True}
+    assert "id" not in fake.last_arguments
+
+
+async def test_inspect_geometry_forwards_include_vertices_false(
+    fake: FakeSketchupClient,
+) -> None:
+    """`include_vertices=False` is the cheap-summary mode; it must reach
+    the Ruby side as a literal false, not get coerced or dropped."""
+    async with make_session() as session:
+        await session.call_tool("inspect_geometry", {"id": "123", "include_vertices": False})
+    assert fake.last_arguments == {"id": "123", "include_vertices": False}
+
+
+async def test_inspect_geometry_omits_unset_id_and_name(fake: FakeSketchupClient) -> None:
+    """When neither id nor name is given the Ruby side must see neither —
+    `resolve_entity` raises the both/neither validation error on that case."""
+    async with make_session() as session:
+        await session.call_tool("inspect_geometry", {})
+    assert fake.last_arguments == {"include_vertices": True}
+
+
+async def test_create_extrusion_negative_extrude_depth_round_trips(
+    fake: FakeSketchupClient,
+) -> None:
+    """Sign of `extrude_depth` controls direction; the Python wrapper must
+    not drop, abs, or clamp a negative depth."""
+    async with make_session() as session:
+        await session.call_tool(
+            "create_extrusion",
+            {
+                "name": "Slab Down",
+                "profile": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                "plane": {"origin": [0, 0, 0], "normal": [0, 0, 1]},
+                "extrude_depth": -2.5,
+            },
+        )
+    assert fake.last_arguments["extrude_depth"] == -2.5
 
 
 # ---------------------------------------------------------------------------
