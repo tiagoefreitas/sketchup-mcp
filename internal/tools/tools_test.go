@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"strings"
 	"sync"
 	"testing"
@@ -242,6 +243,26 @@ func TestCreateComponentPassesExplicitArgsThrough(t *testing.T) {
 	}
 }
 
+func TestCreateComponentForwardsName(t *testing.T) {
+	s := newSession(t)
+	_ = s.call(t, "create_component", map[string]any{
+		"type":       "cube",
+		"name":       "Floor Joist 3",
+		"position":   []float64{0, 0, 0},
+		"dimensions": []float64{1, 1, 1},
+	})
+	args := s.fake.lastArguments(t)
+	mustHave(t, args, "name", "Floor Joist 3")
+}
+
+func TestCreateComponentOmitsUnsetName(t *testing.T) {
+	s := newSession(t)
+	_ = s.call(t, "create_component", map[string]any{
+		"type": "cube",
+	})
+	mustNotHave(t, s.fake.lastArguments(t), "name")
+}
+
 // --- transform_component — None args must be OMITTED, not passed as null ----
 
 func TestTransformComponentOmitsUnsetArgs(t *testing.T) {
@@ -390,7 +411,7 @@ func TestToolForwardsExpectedArguments(t *testing.T) {
 			expectedRubyMethod: "create_dovetail",
 			expectedRubyArgs: map[string]any{
 				"tail_id": "t", "pin_id": "p",
-				"width": 1.0, "height": 1.0, "depth": 1.0,
+				"width": 2.0, "height": 2.0, "depth": 0.25,
 				"angle": 15.0, "num_tails": 3,
 				"offset_x": 0.0, "offset_y": 0.0, "offset_z": 0.0,
 			},
@@ -401,7 +422,7 @@ func TestToolForwardsExpectedArguments(t *testing.T) {
 			expectedRubyMethod: "create_finger_joint",
 			expectedRubyArgs: map[string]any{
 				"board1_id": "a", "board2_id": "b",
-				"width": 1.0, "height": 1.0, "depth": 1.0,
+				"width": 2.0, "height": 2.0, "depth": 1.0,
 				"num_fingers": 5,
 				"offset_x":    0.0, "offset_y": 0.0, "offset_z": 0.0,
 			},
@@ -416,7 +437,7 @@ func TestToolForwardsExpectedArguments(t *testing.T) {
 			toolName:           "find_groups",
 			mcpArgs:            map[string]any{},
 			expectedRubyMethod: "find_groups",
-			expectedRubyArgs:   map[string]any{"limit": 200, "include_components": false},
+			expectedRubyArgs:   map[string]any{"limit": 200, "include_components": false, "recursive": false},
 		},
 	}
 
@@ -480,6 +501,7 @@ func TestFindGroupsForwardsNamePrefix(t *testing.T) {
 		"name_prefix":        "WA ",
 		"limit":              200,
 		"include_components": false,
+		"recursive":          false,
 	}
 	if !jsonEqual(s.fake.lastArguments(t), want) {
 		t.Fatalf("args: %v", s.fake.lastArguments(t))
@@ -494,6 +516,7 @@ func TestFindGroupsForwardsNamePattern(t *testing.T) {
 		"name_pattern":       pattern,
 		"limit":              200,
 		"include_components": false,
+		"recursive":          false,
 	}
 	if !jsonEqual(s.fake.lastArguments(t), want) {
 		t.Fatalf("args: %v", s.fake.lastArguments(t))
@@ -515,6 +538,7 @@ func TestFindGroupsForwardsInBoundsPositive(t *testing.T) {
 		},
 		"limit":              200,
 		"include_components": false,
+		"recursive":          false,
 	}
 	if !jsonEqual(s.fake.lastArguments(t), want) {
 		t.Fatalf("args: %v", s.fake.lastArguments(t))
@@ -558,6 +582,7 @@ func TestFindGroupsForwardsCombinedFilters(t *testing.T) {
 		"parent_id":          42,
 		"limit":              10,
 		"include_components": true,
+		"recursive":          false,
 	}
 	if !jsonEqual(s.fake.lastArguments(t), want) {
 		t.Fatalf("args: %v", s.fake.lastArguments(t))
@@ -580,11 +605,19 @@ func TestFindGroupsForwardsIncludeComponents(t *testing.T) {
 	}
 }
 
+func TestFindGroupsForwardsRecursive(t *testing.T) {
+	s := newSession(t)
+	_ = s.call(t, "find_groups", map[string]any{"recursive": true})
+	if s.fake.lastArguments(t)["recursive"] != true {
+		t.Fatalf("recursive: %v", s.fake.lastArguments(t)["recursive"])
+	}
+}
+
 func TestFindGroupsOmitsUnsetFilters(t *testing.T) {
 	s := newSession(t)
 	_ = s.call(t, "find_groups", map[string]any{})
 	args := s.fake.lastArguments(t)
-	want := map[string]any{"limit": 200, "include_components": false}
+	want := map[string]any{"limit": 200, "include_components": false, "recursive": false}
 	if !jsonEqual(args, want) {
 		t.Fatalf("args: %v", args)
 	}
@@ -694,6 +727,150 @@ func TestBooleanOpRejectsUnknownOperation(t *testing.T) {
 	errStr, _ := env.Error.(string)
 	if !strings.Contains(errStr, "merge") {
 		t.Fatalf("error must mention the offending op; got %q", errStr)
+	}
+}
+
+// --- MCP-frame slimming: structured payloads reach callers ------------------
+//
+// Production Ruby wraps every successful result in an MCP frame
+// ({content, isError, success, resourceId, ...extras}). The Go layer
+// strips the wrapper so callers see the extras directly, with resourceId
+// promoted to "id".
+
+func mcpFrame(extras map[string]any, resourceID any) map[string]any {
+	out := map[string]any{
+		"content":    []any{map[string]any{"type": "text", "text": "Success"}},
+		"isError":    false,
+		"success":    true,
+		"resourceId": resourceID,
+	}
+	maps.Copy(out, extras)
+	return out
+}
+
+func TestCreateComponentSurfacesBoundsPayload(t *testing.T) {
+	s := newSession(t)
+	s.fake.NextResult = mcpFrame(map[string]any{
+		"bounds": map[string]any{
+			"min": []any{0.0, 0.0, 0.0},
+			"max": []any{4.0, 4.0, 4.0},
+		},
+	}, float64(123))
+	env := envelopeOf(t, s.call(t, "create_component", map[string]any{
+		"type": "cube", "position": []float64{0, 0, 0}, "dimensions": []float64{4, 4, 4},
+	}))
+	if !env.Success {
+		t.Fatalf("envelope: %v", env)
+	}
+	want := map[string]any{
+		"bounds": map[string]any{
+			"min": []any{0.0, 0.0, 0.0},
+			"max": []any{4.0, 4.0, 4.0},
+		},
+		"id": float64(123),
+	}
+	if !jsonEqual(env.Result, want) {
+		t.Fatalf("result: got %v, want %v", env.Result, want)
+	}
+}
+
+func TestTransformComponentSurfacesBoundsPayload(t *testing.T) {
+	s := newSession(t)
+	s.fake.NextResult = mcpFrame(map[string]any{
+		"bounds": map[string]any{
+			"min": []any{1.0, 2.0, 3.0},
+			"max": []any{5.0, 6.0, 7.0},
+		},
+	}, float64(42))
+	env := envelopeOf(t, s.call(t, "transform_component", map[string]any{
+		"id": "42", "move_to": []float64{1, 2, 3},
+	}))
+	result := env.Result.(map[string]any)
+	bounds := result["bounds"].(map[string]any)
+	if !jsonEqual(bounds["min"], []any{1.0, 2.0, 3.0}) {
+		t.Fatalf("bounds.min: %v", bounds["min"])
+	}
+	if !jsonEqual(bounds["max"], []any{5.0, 6.0, 7.0}) {
+		t.Fatalf("bounds.max: %v", bounds["max"])
+	}
+}
+
+func TestInspectGeometrySurfacesFacesPayload(t *testing.T) {
+	s := newSession(t)
+	faces := []any{
+		map[string]any{"area": 16.0, "normal": []any{0.0, 0.0, 1.0}},
+	}
+	s.fake.NextResult = mcpFrame(map[string]any{
+		"name":       "Slab",
+		"face_count": float64(6),
+		"edge_count": float64(12),
+		"is_solid":   true,
+		"faces":      faces,
+	}, float64(123))
+	env := envelopeOf(t, s.call(t, "inspect_geometry", map[string]any{"id": "123"}))
+	result := env.Result.(map[string]any)
+	for _, k := range []string{"name", "face_count", "edge_count", "is_solid", "faces", "id"} {
+		if _, ok := result[k]; !ok {
+			t.Fatalf("missing %q in result: %v", k, result)
+		}
+	}
+	if !jsonEqual(result["faces"], faces) {
+		t.Fatalf("faces: %v", result["faces"])
+	}
+}
+
+func TestGetSelectionSurfacesEntitiesPayload(t *testing.T) {
+	s := newSession(t)
+	entities := []any{
+		map[string]any{"id": float64(101), "type": "group"},
+		map[string]any{"id": float64(102), "type": "edge"},
+	}
+	s.fake.NextResult = mcpFrame(map[string]any{"entities": entities}, nil)
+	env := envelopeOf(t, s.call(t, "get_selection", map[string]any{}))
+	result := env.Result.(map[string]any)
+	if !jsonEqual(result["entities"], entities) {
+		t.Fatalf("entities: %v", result["entities"])
+	}
+}
+
+func TestExportSceneSurfacesPathPayload(t *testing.T) {
+	s := newSession(t)
+	s.fake.NextResult = mcpFrame(map[string]any{
+		"path":   "/tmp/sketchup_export_20260101_120000.png",
+		"format": "png",
+	}, nil)
+	env := envelopeOf(t, s.call(t, "export_scene", map[string]any{"format": "png"}))
+	result := env.Result.(map[string]any)
+	if result["path"] != "/tmp/sketchup_export_20260101_120000.png" {
+		t.Fatalf("path: %v", result["path"])
+	}
+	if result["format"] != "png" {
+		t.Fatalf("format: %v", result["format"])
+	}
+}
+
+func TestBooleanOpSurfacesIDAndManifoldPayload(t *testing.T) {
+	s := newSession(t)
+	s.fake.NextResult = mcpFrame(map[string]any{"manifold": true}, float64(555))
+	env := envelopeOf(t, s.call(t, "boolean_op", map[string]any{
+		"operation": "union", "target_id": 1, "tool_id": 2,
+	}))
+	result := env.Result.(map[string]any)
+	if result["id"] != float64(555) {
+		t.Fatalf("id: %v", result["id"])
+	}
+	if result["manifold"] != true {
+		t.Fatalf("manifold: %v", result["manifold"])
+	}
+}
+
+func TestEvalRubyMCPFrameFallsBackToContentText(t *testing.T) {
+	s := newSession(t)
+	s.fake.NextResult = mcpFrame(nil, nil)
+	// MCP frame with no extras and resourceId=nil falls back to content text.
+	env := envelopeOf(t, s.call(t, "eval_ruby", map[string]any{"code": "1+1"}))
+	if env.Result != "Success" {
+		t.Fatalf("result: %v", env.Result)
 	}
 }
 

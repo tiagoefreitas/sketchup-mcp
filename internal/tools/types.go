@@ -14,6 +14,7 @@ package tools
 // server substitutes [0,0,0] and [1,1,1] respectively).
 type CreateComponentInput struct {
 	Type       string    `json:"type,omitempty"`
+	Name       string    `json:"name,omitempty"`
 	Position   []float64 `json:"position,omitempty"`
 	Dimensions []float64 `json:"dimensions,omitempty"`
 }
@@ -79,6 +80,7 @@ type FindGroupsInput struct {
 	ParentID          *int64               `json:"parent_id,omitempty"`
 	Limit             *int                 `json:"limit,omitempty"`
 	IncludeComponents *bool                `json:"include_components,omitempty"`
+	Recursive         *bool                `json:"recursive,omitempty"`
 }
 
 // GetSelectionInput is the (empty) input for the get_selection tool.

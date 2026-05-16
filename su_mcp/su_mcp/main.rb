@@ -332,11 +332,12 @@ module SU_MCP
       log "Got active model: #{model.inspect}"
       entities = model.active_entities
       log "Got active entities: #{entities.inspect}"
-      
+
       pos = params["position"] || [0,0,0]
       dims = params["dimensions"] || [1,1,1]
-      
-      case params["type"]
+      name = params["name"]
+
+      result = case params["type"]
       when "cube"
         log "Creating cube at position #{pos.inspect} with dimensions #{dims.inspect}"
 
@@ -520,6 +521,13 @@ module SU_MCP
       else
         raise "Unknown component type: #{params["type"]}"
       end
+
+      if name && !name.to_s.empty?
+        group = model.find_entity_by_id(result[:id])
+        group.name = name.to_s if group
+        result[:name] = name.to_s
+      end
+      result
     end
 
     def create_extrusion(params)
@@ -1010,13 +1018,15 @@ module SU_MCP
       in_bounds = params["in_bounds"]
       limit = (params["limit"] || 200).to_i
       include_components = params["include_components"] ? true : false
+      recursive = params["recursive"] ? true : false
 
       model = Sketchup.active_model
       entities = resolve_search_root(model, params["parent_id"])
 
       matched = []
       truncated = false
-      entities.each do |entity|
+      walker = recursive ? walk_entities_recursive(entities) : entities.each
+      walker.each do |entity|
         next unless entity_matches_kind?(entity, include_components)
         next unless name_matches?(entity.name, prefix, pattern)
         next unless bounds_matches?(entity.bounds, in_bounds)
@@ -1029,6 +1039,24 @@ module SU_MCP
       end
 
       { success: true, groups: matched, truncated: truncated }
+    end
+
+    # Yields every entity reachable from `entities`, descending into nested
+    # Groups (and ComponentInstance definitions). Order is depth-first so
+    # parents are visited before children — matters only for limit truncation.
+    def walk_entities_recursive(entities)
+      Enumerator.new do |y|
+        stack = entities.to_a.reverse
+        until stack.empty?
+          e = stack.pop
+          y << e
+          if e.is_a?(Sketchup::Group)
+            e.entities.to_a.reverse.each { |child| stack.push(child) }
+          elsif e.is_a?(Sketchup::ComponentInstance) && e.respond_to?(:definition)
+            e.definition.entities.to_a.reverse.each { |child| stack.push(child) }
+          end
+        end
+      end
     end
 
     def resolve_search_root(model, parent_id)
@@ -1149,13 +1177,23 @@ module SU_MCP
     # Pure: validate the geometry dict accepted by replace_geometry and the
     # "replace" batch op. Centralizes both shape and op-name checks so the
     # error message points at the actual problem.
+    #
+    # Accepts either "op" (batch_create vocabulary) or "type" (standalone
+    # create_component vocabulary) as the shape selector; if both are
+    # supplied they must agree. Returns the resolved op string.
     def validate_replace_geometry_dict(geometry)
       raise "'geometry' is required" if geometry.nil?
       raise "'geometry' must be a Hash" unless geometry.is_a?(Hash)
-      op = geometry["op"].to_s
-      unless KNOWN_REPLACE_GEOMETRY_OPS.include?(op)
-        raise "geometry 'op' must be one of: #{KNOWN_REPLACE_GEOMETRY_OPS.join(', ')} (got #{geometry["op"].inspect})"
+      op_val = geometry["op"]
+      type_val = geometry["type"]
+      if op_val && type_val && op_val.to_s != type_val.to_s
+        raise "geometry has both 'op' (#{op_val.inspect}) and 'type' (#{type_val.inspect}); supply one"
       end
+      op = (op_val || type_val).to_s
+      unless KNOWN_REPLACE_GEOMETRY_OPS.include?(op)
+        raise "geometry shape must be one of: #{KNOWN_REPLACE_GEOMETRY_OPS.join(', ')} (got #{(op_val || type_val).inspect})"
+      end
+      op
     end
 
     # Adapter: nested Groups + ComponentInstances inside a target. Pulled
@@ -1169,7 +1207,7 @@ module SU_MCP
     # name so we can stamp it on creates that take a name directly
     # (extrusion) without an extra .name= pass.
     def build_replacement_group(geometry, preserved_name)
-      op = geometry["op"].to_s
+      op = (geometry["op"] || geometry["type"]).to_s
       model = Sketchup.active_model
       if op == "extrusion"
         extrusion_params = geometry.dup
@@ -1439,6 +1477,28 @@ module SU_MCP
       end
     end
     
+    # CSG primitive shared by boolean_operation and the joinery handlers.
+    # SketchUp Pro's Solid Tools live on Sketchup::Group as instance methods
+    # (#union/#subtract/#intersect/#outer_shell); they consume both inputs
+    # and return a new manifold Group, or nil if Pro is unavailable / either
+    # input is non-manifold. Sketchup::Entities has no .subtract — using
+    # the entities collection raises NoMethodError, which is the regression
+    # that motivated this helper.
+    def solid_csg(target, tool, operation)
+      unless target.is_a?(Sketchup::Group) && tool.is_a?(Sketchup::Group)
+        raise "solid_csg requires two Sketchup::Group inputs (got #{target.class} and #{tool.class})"
+      end
+      unless target.respond_to?(operation)
+        raise "Solid Tools #{operation} unavailable — requires SketchUp Pro"
+      end
+      unless target.respond_to?(:manifold?) && target.manifold? && tool.manifold?
+        raise "Solid Tools #{operation} requires manifold solids — check inputs with Sketchup::Group#manifold?"
+      end
+      result = target.send(operation, tool)
+      raise "Solid Tools #{operation} returned nil — inputs must be manifold solids" if result.nil?
+      result
+    end
+
     # CSG via SketchUp Pro's Solid Tools (Sketchup::Group#union/subtract/intersect/
      # outer_shell). The Pro API consumes both inputs and returns a new manifold
      # group on success or nil if either input isn't a solid / Pro is unavailable.
@@ -1470,39 +1530,33 @@ module SU_MCP
         raise "Entity not found: #{missing.join(', ')}"
       end
 
-      unless target_entity.is_a?(Sketchup::Group) && tool_entity.is_a?(Sketchup::Group)
-        raise "Boolean operations require two Sketchup::Group inputs (got #{target_entity.class} and #{tool_entity.class})"
+      # Solid Tools always consumes both operands; `delete_originals=false`
+      # would need a copy-the-group dance that Sketchup::Group doesn't
+      # expose directly (the legacy implementation tried .copy on each
+      # contained Edge — the 'undefined method copy for Sketchup::Edge'
+      # regression that produced this bug). Refuse explicitly rather
+      # than emitting half-formed geometry.
+      if params.key?("delete_originals") && params["delete_originals"] == false
+        raise "delete_originals: false is not supported — Solid Tools consumes both operands"
       end
 
-      # Solid Tools require both inputs to be manifold solids.
-      unless target_entity.respond_to?(:manifold?) && target_entity.manifold? && tool_entity.manifold?
-        raise "Boolean operations require manifold solids — check inputs with Sketchup::Group#manifold?"
-      end
+      # Wrap the whole CSG in a single transaction so any failure
+      # (non-manifold inputs, Pro unavailable) rolls back cleanly —
+      # partial geometry leaks were the second half of sch-mtl.
+      model.start_operation("Boolean #{operation}", true)
+      begin
+        result_group = solid_csg(target_entity, tool_entity, operation.to_sym)
+        model.commit_operation
 
-      # delete_originals defaults to true (Solid Tools' native behavior). When
-      # false, work on copies so the originals survive.
-      keep_originals = params.key?("delete_originals") && params["delete_originals"] == false
-      if keep_originals
-        target_op = target_entity.copy
-        tool_op = tool_entity.copy
-      else
-        target_op = target_entity
-        tool_op = tool_entity
+        {
+          success: true,
+          id: result_group.entityID,
+          manifold: result_group.respond_to?(:manifold?) ? result_group.manifold? : nil
+        }
+      rescue StandardError
+        model.abort_operation
+        raise
       end
-
-      result_group = target_op.send(operation, tool_op)
-      if result_group.nil?
-        # Clean up any copies we made for keep_originals mode.
-        target_op.erase! if keep_originals && target_op.valid?
-        tool_op.erase! if keep_originals && tool_op.valid?
-        raise "Solid Tools #{operation} returned nil — requires SketchUp Pro and two manifold solids"
-      end
-
-      {
-        success: true,
-        id: result_group.entityID,
-        manifold: result_group.respond_to?(:manifold?) ? result_group.manifold? : nil
-      }
     end
     
     def chamfer_edges(params)
@@ -1856,62 +1910,59 @@ module SU_MCP
     
     def create_mortise(board, width, height, depth, face_direction, bounds, offset_x, offset_y, offset_z)
       model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Calculate the position of the mortise based on the face direction
+
+      # Calculate the position of the mortise based on the face direction.
       mortise_position = calculate_position_on_face(face_direction, bounds, width, height, depth, offset_x, offset_y, offset_z)
-      
+
       log "Creating mortise at position: #{mortise_position.inspect} with dimensions: #{[width, height, depth].inspect}"
-      
-      # Create a box for the mortise
-      mortise_group = entities.add_group
-      
-      # Create the mortise box with the correct orientation
-      case face_direction
-      when :east, :west
-        # Mortise on east or west face (YZ plane)
-        mortise_face = mortise_group.entities.add_face(
-          [mortise_position[0], mortise_position[1], mortise_position[2]],
-          [mortise_position[0], mortise_position[1] + width, mortise_position[2]],
-          [mortise_position[0], mortise_position[1] + width, mortise_position[2] + height],
-          [mortise_position[0], mortise_position[1], mortise_position[2] + height]
-        )
-        mortise_face.pushpull(face_direction == :east ? -depth : depth)
-      when :north, :south
-        # Mortise on north or south face (XZ plane)
-        mortise_face = mortise_group.entities.add_face(
-          [mortise_position[0], mortise_position[1], mortise_position[2]],
-          [mortise_position[0] + width, mortise_position[1], mortise_position[2]],
-          [mortise_position[0] + width, mortise_position[1], mortise_position[2] + height],
-          [mortise_position[0], mortise_position[1], mortise_position[2] + height]
-        )
-        mortise_face.pushpull(face_direction == :north ? -depth : depth)
-      when :top, :bottom
-        # Mortise on top or bottom face (XY plane)
-        mortise_face = mortise_group.entities.add_face(
-          [mortise_position[0], mortise_position[1], mortise_position[2]],
-          [mortise_position[0] + width, mortise_position[1], mortise_position[2]],
-          [mortise_position[0] + width, mortise_position[1] + height, mortise_position[2]],
-          [mortise_position[0], mortise_position[1] + height, mortise_position[2]]
-        )
-        mortise_face.pushpull(face_direction == :top ? -depth : depth)
+
+      # Create the mortise as a top-level solid group. Solid Tools'
+      # Sketchup::Group#subtract requires both operands to be top-level
+      # groups; building inside board.entities and calling
+      # entities.subtract (which does not exist) was the prior regression.
+      mortise_group = model.active_entities.add_group
+
+      model.start_operation("Create mortise", true)
+      begin
+        case face_direction
+        when :east, :west
+          mortise_face = mortise_group.entities.add_face(
+            [mortise_position[0], mortise_position[1], mortise_position[2]],
+            [mortise_position[0], mortise_position[1] + width, mortise_position[2]],
+            [mortise_position[0], mortise_position[1] + width, mortise_position[2] + height],
+            [mortise_position[0], mortise_position[1], mortise_position[2] + height]
+          )
+          mortise_face.pushpull(face_direction == :east ? -depth : depth)
+        when :north, :south
+          mortise_face = mortise_group.entities.add_face(
+            [mortise_position[0], mortise_position[1], mortise_position[2]],
+            [mortise_position[0] + width, mortise_position[1], mortise_position[2]],
+            [mortise_position[0] + width, mortise_position[1], mortise_position[2] + height],
+            [mortise_position[0], mortise_position[1], mortise_position[2] + height]
+          )
+          mortise_face.pushpull(face_direction == :north ? -depth : depth)
+        when :top, :bottom
+          mortise_face = mortise_group.entities.add_face(
+            [mortise_position[0], mortise_position[1], mortise_position[2]],
+            [mortise_position[0] + width, mortise_position[1], mortise_position[2]],
+            [mortise_position[0] + width, mortise_position[1] + height, mortise_position[2]],
+            [mortise_position[0], mortise_position[1] + height, mortise_position[2]]
+          )
+          mortise_face.pushpull(face_direction == :top ? -depth : depth)
+        end
+
+        # Subtract via SU Pro Solid Tools. Both operands are consumed and
+        # `result` is a new top-level Group that replaces `board`.
+        result = solid_csg(board, mortise_group, :subtract)
+        model.commit_operation
+
+        { success: true, id: result.entityID }
+      rescue StandardError
+        model.abort_operation
+        raise
       end
-      
-      # Subtract the mortise from the board
-      entities.subtract(mortise_group.entities)
-      
-      # Clean up the temporary group
-      mortise_group.erase!
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
     end
-    
+
     def create_tenon(board, width, height, depth, face_direction, bounds, offset_x, offset_y, offset_z)
       model = Sketchup.active_model
       
@@ -2030,40 +2081,47 @@ module SU_MCP
     def create_dovetail(params)
       log "Creating dovetail joint with params: #{params.inspect}"
       model = Sketchup.active_model
-      
+
       # Get the tail and pin board IDs
       tail_id = params["tail_id"].to_s.gsub('"', '')
       pin_id = params["pin_id"].to_s.gsub('"', '')
-      
+
       log "Looking for tail board with ID: #{tail_id}"
       tail_board = model.find_entity_by_id(tail_id.to_i)
-      
+
       log "Looking for pin board with ID: #{pin_id}"
       pin_board = model.find_entity_by_id(pin_id.to_i)
-      
+
       unless tail_board && pin_board
         missing = []
         missing << "tail board" unless tail_board
         missing << "pin board" unless pin_board
         raise "Entity not found: #{missing.join(', ')}"
       end
-      
+
       # Ensure both entities are groups or component instances
       unless (tail_board.is_a?(Sketchup::Group) || tail_board.is_a?(Sketchup::ComponentInstance)) &&
              (pin_board.is_a?(Sketchup::Group) || pin_board.is_a?(Sketchup::ComponentInstance))
         raise "Dovetail operation requires groups or component instances"
       end
-      
-      # Get joint parameters
-      width = params["width"] || 1.0
+
+      # Get joint parameters. Defaults match the Go handler's: a width/depth
+      # combo where adjacent tail bottoms don't overlap with the default
+      # angle/num_tails — see validate_dovetail_geometry!.
+      width = params["width"] || 2.0
       height = params["height"] || 2.0
-      depth = params["depth"] || 1.0
+      depth = params["depth"] || 0.25
       angle = params["angle"] || 15.0  # Dovetail angle in degrees
-      num_tails = params["num_tails"] || 3
+      num_tails = (params["num_tails"] || 3).to_i
       offset_x = params["offset_x"] || 0.0
       offset_y = params["offset_y"] || 0.0
       offset_z = params["offset_z"] || 0.0
-      
+
+      # Validate dovetail geometry up-front so failures surface as readable
+      # messages rather than SketchUp's cryptic 'Duplicate points in array'
+      # when add_face is handed a degenerate trapezoid.
+      validate_dovetail_geometry!(width, height, depth, angle, num_tails)
+
       # Create the tails on the tail board
       tail_result = create_tails(tail_board, width, height, depth, angle, num_tails, offset_x, offset_y, offset_z)
       
@@ -2078,6 +2136,46 @@ module SU_MCP
       }
     end
     
+    # Pure: validate dovetail geometry before any add_face. Catches the
+    # parameter combos that would otherwise reach add_face as a degenerate
+    # polygon ('Duplicate points in array') or a self-intersecting
+    # trapezoid (bottom width exceeds the per-tail slot).
+    def validate_dovetail_geometry!(width, height, depth, angle, num_tails)
+      raise "num_tails must be >= 1 (got #{num_tails})" if num_tails < 1
+      raise "width must be > 0 (got #{width})" if width <= 0
+      raise "height must be > 0 (got #{height})" if height <= 0
+      raise "depth must be > 0 (got #{depth})" if depth <= 0
+      raise "angle must be > 0 and < 90 (got #{angle})" if angle <= 0 || angle >= 90
+
+      # Each tail occupies one slot of width = total_width / (2 * num_tails - 1).
+      # Tail flares outward by depth * tan(angle) on each side; if the bottom
+      # width exceeds 2 * tail_width the adjacent bottoms self-overlap and
+      # add_face starts producing degenerate trapezoid corners.
+      tail_width = width.to_f / (2 * num_tails - 1)
+      max_flare = depth.to_f * Math.tan(angle * Math::PI / 180.0)
+      tail_bottom_width = tail_width + 2 * max_flare
+      if tail_bottom_width > 2 * tail_width
+        raise "dovetail tail width too small for num_tails=#{num_tails}, depth=#{depth}, angle=#{angle}: tail spacing #{tail_width.round(4)} can't contain a #{tail_bottom_width.round(4)}-wide flare — reduce depth or num_tails, or increase width"
+      end
+    end
+
+    # Pure: drop near-duplicate points (within `epsilon` inches) so add_face
+    # never sees coincident vertices that would raise 'Duplicate points in
+    # array'. Compares against every kept point — N is small (4 for a tail
+    # trapezoid).
+    def dedupe_points(points, epsilon = 1e-6)
+      kept = []
+      points.each do |pt|
+        already = kept.any? do |k|
+          (k[0] - pt[0]).abs < epsilon &&
+            (k[1] - pt[1]).abs < epsilon &&
+            (k[2] - pt[2]).abs < epsilon
+        end
+        kept << pt unless already
+      end
+      kept
+    end
+
     def create_tails(board, width, height, depth, angle, num_tails, offset_x, offset_y, offset_z)
       model = Sketchup.active_model
       
@@ -2110,16 +2208,19 @@ module SU_MCP
         tail_bottom_width = tail_width + 2 * depth * Math.tan(angle_rad)
         
         # Create the tail shape
-        tail_points = [
+        tail_points = dedupe_points([
           [tail_center_x - tail_top_width/2, center_y - height/2, center_z],
           [tail_center_x + tail_top_width/2, center_y - height/2, center_z],
           [tail_center_x + tail_bottom_width/2, center_y - height/2, center_z - depth],
           [tail_center_x - tail_bottom_width/2, center_y - height/2, center_z - depth]
-        ]
-        
+        ])
+        if tail_points.length < 3
+          raise "dovetail tail #{i + 1} collapsed to #{tail_points.length} points — params too small for the chosen num_tails"
+        end
+
         # Create the tail face
         tail_face = tails_group.entities.add_face(tail_points)
-        
+
         # Extrude the tail
         tail_face.pushpull(height)
       end
@@ -2133,69 +2234,61 @@ module SU_MCP
     
     def create_pins(board, width, height, depth, angle, num_tails, offset_x, offset_y, offset_z)
       model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Get the board's bounds
+
+      # Get the board's bounds (parent-coord; for top-level boards, world).
       bounds = board.bounds
-      
+
       # Calculate the position of the dovetail joint
       center_x = bounds.center.x + offset_x
       center_y = bounds.center.y + offset_y
       center_z = bounds.center.z + offset_z
-      
+
       # Calculate the width of each tail and space
       total_width = width
       tail_width = total_width / (2 * num_tails - 1)
-      
-      # Create a group for the pins
-      pins_group = entities.add_group
-      
-      # Create a box for the entire pin area
+
+      # Build the pin block at top level so Solid Tools can subtract each
+      # tail cutout from it. (entities.subtract on Sketchup::Entities does
+      # not exist — the legacy implementation crashed with NoMethodError.)
+      pins_group = model.active_entities.add_group
+
       pin_area_face = pins_group.entities.add_face(
         [center_x - width/2, center_y - height/2, center_z],
         [center_x + width/2, center_y - height/2, center_z],
         [center_x + width/2, center_y + height/2, center_z],
         [center_x - width/2, center_y + height/2, center_z]
       )
-      
+
       # Extrude the pin area
       pin_area_face.pushpull(depth)
-      
-      # Create each tail cutout
+
+      # Subtract each tail cutout via the shared solid_csg helper. Each
+      # iteration consumes pins_group and returns the new manifold group.
       num_tails.times do |i|
-        # Calculate the position of this tail
         tail_center_x = center_x - width/2 + tail_width * (2 * i)
-        
-        # Calculate the dovetail shape
         angle_rad = angle * Math::PI / 180.0
         tail_top_width = tail_width
         tail_bottom_width = tail_width + 2 * depth * Math.tan(angle_rad)
-        
-        # Create a group for the tail cutout
-        tail_cutout_group = entities.add_group
-        
-        # Create the tail cutout shape
-        tail_points = [
+
+        tail_cutout_group = model.active_entities.add_group
+        tail_points = dedupe_points([
           [tail_center_x - tail_top_width/2, center_y - height/2, center_z],
           [tail_center_x + tail_top_width/2, center_y - height/2, center_z],
           [tail_center_x + tail_bottom_width/2, center_y - height/2, center_z - depth],
           [tail_center_x - tail_bottom_width/2, center_y - height/2, center_z - depth]
-        ]
-        
-        # Create the tail cutout face
+        ])
+        if tail_points.length < 3
+          raise "dovetail pin cutout #{i + 1} collapsed to #{tail_points.length} points — params too small for the chosen num_tails"
+        end
+
         tail_face = tail_cutout_group.entities.add_face(tail_points)
-        
-        # Extrude the tail cutout
         tail_face.pushpull(height)
-        
-        # Subtract the tail cutout from the pin area
-        pins_group.entities.subtract(tail_cutout_group.entities)
-        
-        # Clean up the temporary group
-        tail_cutout_group.erase!
+
+        pins_group = solid_csg(pins_group, tail_cutout_group, :subtract)
       end
+
+      # Fuse the pin block into the board so the joint stays attached.
+      board = solid_csg(board, pins_group, :union)
       
       # Return the result
       { 
@@ -2207,168 +2300,155 @@ module SU_MCP
     def create_finger_joint(params)
       log "Creating finger joint with params: #{params.inspect}"
       model = Sketchup.active_model
-      
+
       # Get the two board IDs
       board1_id = params["board1_id"].to_s.gsub('"', '')
       board2_id = params["board2_id"].to_s.gsub('"', '')
-      
+
       log "Looking for board 1 with ID: #{board1_id}"
       board1 = model.find_entity_by_id(board1_id.to_i)
-      
+
       log "Looking for board 2 with ID: #{board2_id}"
       board2 = model.find_entity_by_id(board2_id.to_i)
-      
+
       unless board1 && board2
         missing = []
         missing << "board 1" unless board1
         missing << "board 2" unless board2
         raise "Entity not found: #{missing.join(', ')}"
       end
-      
+
       # Ensure both entities are groups or component instances
       unless (board1.is_a?(Sketchup::Group) || board1.is_a?(Sketchup::ComponentInstance)) &&
              (board2.is_a?(Sketchup::Group) || board2.is_a?(Sketchup::ComponentInstance))
         raise "Finger joint operation requires groups or component instances"
       end
-      
+
       # Get joint parameters
-      width = params["width"] || 1.0
+      width = params["width"] || 2.0
       height = params["height"] || 2.0
       depth = params["depth"] || 1.0
-      num_fingers = params["num_fingers"] || 5
+      num_fingers = (params["num_fingers"] || 5).to_i
       offset_x = params["offset_x"] || 0.0
       offset_y = params["offset_y"] || 0.0
       offset_z = params["offset_z"] || 0.0
-      
+
+      # Validate up-front so degenerate params produce a readable error
+      # rather than SketchUp's 'Duplicate points in array'.
+      validate_finger_joint_geometry!(width, height, depth, num_fingers)
+
       # Create the fingers on board 1
       board1_result = create_board1_fingers(board1, width, height, depth, num_fingers, offset_x, offset_y, offset_z)
-      
+
       # Create the matching slots on board 2
       board2_result = create_board2_slots(board2, width, height, depth, num_fingers, offset_x, offset_y, offset_z)
-      
+
       # Return the result
-      { 
-        success: true, 
+      {
+        success: true,
         board1_id: board1_result[:id],
         board2_id: board2_result[:id]
       }
     end
-    
-    def create_board1_fingers(board, width, height, depth, num_fingers, offset_x, offset_y, offset_z)
-      model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Get the board's bounds
-      bounds = board.bounds
-      
-      # Calculate the position of the joint
-      center_x = bounds.center.x + offset_x
-      center_y = bounds.center.y + offset_y
-      center_z = bounds.center.z + offset_z
-      
-      # Calculate the width of each finger
-      finger_width = width / num_fingers
-      
-      # Create a group for the fingers
-      fingers_group = entities.add_group
-      
-      # Create a base rectangle for the joint area
-      base_face = fingers_group.entities.add_face(
-        [center_x - width/2, center_y - height/2, center_z],
-        [center_x + width/2, center_y - height/2, center_z],
-        [center_x + width/2, center_y + height/2, center_z],
-        [center_x - width/2, center_y + height/2, center_z]
-      )
-      
-      # Create cutouts for the spaces between fingers
-      (num_fingers / 2).times do |i|
-        # Calculate the position of this cutout
-        cutout_center_x = center_x - width/2 + finger_width * (2 * i + 1)
-        
-        # Create a group for the cutout
-        cutout_group = entities.add_group
-        
-        # Create the cutout shape
-        cutout_face = cutout_group.entities.add_face(
-          [cutout_center_x - finger_width/2, center_y - height/2, center_z],
-          [cutout_center_x + finger_width/2, center_y - height/2, center_z],
-          [cutout_center_x + finger_width/2, center_y + height/2, center_z],
-          [cutout_center_x - finger_width/2, center_y + height/2, center_z]
-        )
-        
-        # Extrude the cutout
-        cutout_face.pushpull(depth)
-        
-        # Subtract the cutout from the fingers
-        fingers_group.entities.subtract(cutout_group.entities)
-        
-        # Clean up the temporary group
-        cutout_group.erase!
+
+    # Pure: catch parameter combos that would produce degenerate finger
+    # rectangles before add_face turns them into 'Duplicate points in array'.
+    def validate_finger_joint_geometry!(width, height, depth, num_fingers)
+      raise "num_fingers must be >= 1 (got #{num_fingers})" if num_fingers < 1
+      raise "width must be > 0 (got #{width})" if width <= 0
+      raise "height must be > 0 (got #{height})" if height <= 0
+      raise "depth must be > 0 (got #{depth})" if depth <= 0
+
+      # Proper finger joint: num_fingers fingers + (num_fingers - 1) gaps,
+      # each of equal slot_width. Reject configurations where the per-slot
+      # width is below a build-safe floor (1e-4 inches).
+      segments = 2 * num_fingers - 1
+      slot_width = width.to_f / segments
+      if slot_width < 1.0e-4
+        raise "finger joint slot width #{slot_width} too small for width=#{width}, num_fingers=#{num_fingers} — increase width or reduce num_fingers"
       end
-      
-      # Extrude the fingers
-      base_face.pushpull(depth)
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
     end
     
-    def create_board2_slots(board, width, height, depth, num_fingers, offset_x, offset_y, offset_z)
+    # Build a top-level rectangular cutout group at the joint plane.
+    # Centralized so board1 and board2 share the same slot geometry.
+    def finger_slot_group(model, cx, cz, slot_width, height, depth, cy_min, cy_max)
+      g = model.active_entities.add_group
+      pts = dedupe_points([
+        [cx - slot_width/2, cy_min, cz],
+        [cx + slot_width/2, cy_min, cz],
+        [cx + slot_width/2, cy_max, cz],
+        [cx - slot_width/2, cy_max, cz]
+      ])
+      raise "finger slot collapsed to #{pts.length} points" if pts.length < 3
+      face = g.entities.add_face(pts)
+      face.pushpull(depth)
+      g
+    end
+
+    def create_board1_fingers(board, width, height, depth, num_fingers, offset_x, offset_y, offset_z)
       model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Get the board's bounds
       bounds = board.bounds
-      
-      # Calculate the position of the joint
+
       center_x = bounds.center.x + offset_x
       center_y = bounds.center.y + offset_y
       center_z = bounds.center.z + offset_z
-      
-      # Calculate the width of each finger
-      finger_width = width / num_fingers
-      
-      # Create a group for the slots
-      slots_group = entities.add_group
-      
-      # Create cutouts for the fingers from board 1
-      (num_fingers / 2 + num_fingers % 2).times do |i|
-        # Calculate the position of this cutout
-        cutout_center_x = center_x - width/2 + finger_width * (2 * i)
-        
-        # Create a group for the cutout
-        cutout_group = entities.add_group
-        
-        # Create the cutout shape
-        cutout_face = cutout_group.entities.add_face(
-          [cutout_center_x - finger_width/2, center_y - height/2, center_z],
-          [cutout_center_x + finger_width/2, center_y - height/2, center_z],
-          [cutout_center_x + finger_width/2, center_y + height/2, center_z],
-          [cutout_center_x - finger_width/2, center_y + height/2, center_z]
-        )
-        
-        # Extrude the cutout
-        cutout_face.pushpull(depth)
-        
-        # Subtract the cutout from the board
-        entities.subtract(cutout_group.entities)
-        
-        # Clean up the temporary group
-        cutout_group.erase!
+
+      # Proper finger geometry: 2*num_fingers - 1 equal segments alternating
+      # finger / gap, so finger_width = width / (2 * num_fingers - 1). The
+      # legacy width/num_fingers formula left the joint asymmetric and made
+      # the last segment wider, which contributed to the duplicate-point
+      # geometry failures.
+      slot_width = width.to_f / (2 * num_fingers - 1)
+      cy_min = center_y - height / 2.0
+      cy_max = center_y + height / 2.0
+
+      # Build the finger block at top level (Solid Tools requires top-level
+      # groups; the legacy code built inside board.entities and called the
+      # non-existent Sketchup::Entities#subtract).
+      fingers_group = model.active_entities.add_group
+      base_face = fingers_group.entities.add_face(
+        [center_x - width/2, cy_min, center_z],
+        [center_x + width/2, cy_min, center_z],
+        [center_x + width/2, cy_max, center_z],
+        [center_x - width/2, cy_max, center_z]
+      )
+      base_face.pushpull(depth)
+
+      # Carve out gap slots at odd segment indices (1, 3, ...). num_fingers
+      # fingers leave (num_fingers - 1) gaps.
+      (num_fingers - 1).times do |i|
+        gap_center_x = center_x - width/2 + slot_width * (2 * i + 1) + slot_width / 2.0
+        cutout = finger_slot_group(model, gap_center_x, center_z, slot_width, height, depth, cy_min, cy_max)
+        fingers_group = solid_csg(fingers_group, cutout, :subtract)
       end
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
+
+      # Fuse the finger block into the board so the joint stays attached.
+      board = solid_csg(board, fingers_group, :union)
+
+      { success: true, id: board.entityID }
+    end
+
+    def create_board2_slots(board, width, height, depth, num_fingers, offset_x, offset_y, offset_z)
+      model = Sketchup.active_model
+      bounds = board.bounds
+
+      center_x = bounds.center.x + offset_x
+      center_y = bounds.center.y + offset_y
+      center_z = bounds.center.z + offset_z
+
+      slot_width = width.to_f / (2 * num_fingers - 1)
+      cy_min = center_y - height / 2.0
+      cy_max = center_y + height / 2.0
+
+      # Carve slots in the board at even segment indices (0, 2, ...) so they
+      # accept the fingers from board1.
+      num_fingers.times do |i|
+        slot_center_x = center_x - width/2 + slot_width * (2 * i) + slot_width / 2.0
+        cutout = finger_slot_group(model, slot_center_x, center_z, slot_width, height, depth, cy_min, cy_max)
+        board = solid_csg(board, cutout, :subtract)
+      end
+
+      { success: true, id: board.entityID }
     end
     
     def eval_ruby(params)
