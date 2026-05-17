@@ -6,10 +6,13 @@ package skpclient
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -19,6 +22,15 @@ type Client struct {
 	Port    int
 	Timeout time.Duration
 
+	// CallTimeout bounds an entire request/response cycle on an open socket.
+	// Once the TCP connection is established, the read+write must complete
+	// within this budget — otherwise SetDeadline trips and the call returns
+	// a timeout error. Zero means no per-call deadline.
+	//
+	// Defaulted generously by New() because some tools (large boolean_op,
+	// batch_create on big models, eval_ruby) are legitimately slow.
+	CallTimeout time.Duration
+
 	// Dialer is an optional hook for tests. When nil, SendCommand dials TCP
 	// to Host:Port with Timeout.
 	Dialer func() (net.Conn, error)
@@ -27,9 +39,16 @@ type Client struct {
 	Logger *slog.Logger
 }
 
-// New returns a Client with a 15-second timeout, matching the Python default.
+// New returns a Client with a 3-second dial timeout (localhost: extension
+// running = connect is near-instant; extension not running = we want a
+// fast failure) and a 120-second per-call timeout.
 func New(host string, port int) *Client {
-	return &Client{Host: host, Port: port, Timeout: 15 * time.Second}
+	return &Client{
+		Host:        host,
+		Port:        port,
+		Timeout:     3 * time.Second,
+		CallTimeout: 120 * time.Second,
+	}
 }
 
 func (c *Client) logger() *slog.Logger {
@@ -81,19 +100,38 @@ func (c *Client) SendCommand(method string, params map[string]any, requestID any
 	}
 	defer conn.Close()
 
+	if c.CallTimeout > 0 {
+		_ = conn.SetDeadline(time.Now().Add(c.CallTimeout))
+	}
+
 	if err := c.sendRequest(conn, request); err != nil {
-		return nil, err
+		return nil, wrapTimeoutErr(err, c.CallTimeout)
 	}
 	response, err := c.readResponse(conn)
 	if err != nil {
-		return nil, err
+		return nil, wrapTimeoutErr(err, c.CallTimeout)
 	}
 	return unwrapResponse(response)
 }
 
+// wrapTimeoutErr replaces a net-timeout error with a user-facing
+// SketchupTimeoutError. Non-timeout errors pass through unchanged.
+func wrapTimeoutErr(err error, budget time.Duration) error {
+	if err == nil {
+		return nil
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return &SketchupTimeoutError{Budget: budget, Cause: err}
+	}
+	return err
+}
+
 func (c *Client) connectWithRetries(maxRetries int) (net.Conn, error) {
 	var lastErr error
+	attempts := 0
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		attempts++
 		conn, err := c.openSocket()
 		if err == nil {
 			return conn, nil
@@ -103,9 +141,44 @@ func (c *Client) connectWithRetries(maxRetries int) (net.Conn, error) {
 			"attempt", attempt+1,
 			"of", maxRetries+1,
 			"err", err)
+		// Connection-refused = extension is not running; retrying won't
+		// help and just delays the user-visible failure. Fail fast.
+		if isConnRefused(err) {
+			break
+		}
+	}
+	if isExtensionUnreachable(lastErr) {
+		return nil, &ExtensionUnreachableError{Host: c.Host, Port: c.Port, Cause: lastErr}
 	}
 	return nil, fmt.Errorf("could not connect to SketchUp at %s:%d after %d attempts: %w",
-		c.Host, c.Port, maxRetries+1, lastErr)
+		c.Host, c.Port, attempts, lastErr)
+}
+
+// isConnRefused reports whether err is a "connection refused" dial error.
+func isConnRefused(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
+// isExtensionUnreachable matches the dial-class failures that indicate the
+// extension is not running or unreachable on the network.
+func isExtensionUnreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isConnRefused(err) {
+		return true
+	}
+	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		var opErr *net.OpError
+		if errors.As(err, &opErr) && opErr.Op == "dial" {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) sendRequest(conn net.Conn, request map[string]any) error {
@@ -132,35 +205,46 @@ func (c *Client) sendRequest(conn net.Conn, request map[string]any) error {
 func (c *Client) readResponse(conn net.Conn) (any, error) {
 	// Both sides terminate JSON messages with '\n', so one ReadBytes = one message.
 	reader := bufio.NewReader(conn)
-	line, err := reader.ReadBytes('\n')
+	line, readErr := reader.ReadBytes('\n')
 	if len(line) == 0 {
-		if err != nil {
-			return nil, fmt.Errorf("connection closed before receiving any data: %w", err)
+		if readErr != nil {
+			return nil, fmt.Errorf("connection closed before receiving any data: %w", readErr)
 		}
 		return nil, fmt.Errorf("connection closed before receiving any data")
 	}
 	// Trim trailing newline if present; tolerate missing newline at EOF.
-	if line[len(line)-1] == '\n' {
+	hadNewline := line[len(line)-1] == '\n'
+	if hadNewline {
 		line = line[:len(line)-1]
 	}
 	var parsed any
 	if err := json.Unmarshal(line, &parsed); err != nil {
+		// A connection dropped mid-message will return bytes without a
+		// trailing newline plus io.EOF / io.ErrUnexpectedEOF. Distinguish
+		// that from genuinely malformed JSON the server sent.
+		if !hadNewline && (errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF)) {
+			return nil, fmt.Errorf("connection dropped mid-response (extension likely crashed or SketchUp quit) — partial bytes: %d", len(line))
+		}
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
 	return parsed, nil
 }
 
-// unwrapResponse mirrors the Python _unwrap_response:
+// unwrapResponse extracts the result from a JSON-RPC envelope:
 //   - non-dict responses are returned as-is
-//   - presence of an "error" key (even with null value, mirroring Python's
-//     `in` check) raises with the error.message or a default string
+//   - a non-null "error" value raises with error.message or a default string;
+//     {"error": null} is treated as success (this diverges intentionally from
+//     the Python _unwrap_response, whose `in` check treats key presence —
+//     even with null value — as failure, and would silently discard the real
+//     result for standard JSON-RPC 2.0 envelopes that include error=null on
+//     success)
 //   - otherwise returns result["result"] or an empty map if missing
 func unwrapResponse(response any) (any, error) {
 	m, ok := response.(map[string]any)
 	if !ok {
 		return response, nil
 	}
-	if errVal, present := m["error"]; present {
+	if errVal, present := m["error"]; present && errVal != nil {
 		msg := "Unknown error from Sketchup"
 		if errMap, ok := errVal.(map[string]any); ok {
 			if s, ok := errMap["message"].(string); ok && s != "" {
@@ -182,3 +266,37 @@ type SketchupError struct {
 }
 
 func (e *SketchupError) Error() string { return e.Message }
+
+// ExtensionUnreachableError signals that the SketchUp Ruby extension could
+// not be reached over TCP — the extension is probably not running.
+type ExtensionUnreachableError struct {
+	Host  string
+	Port  int
+	Cause error
+}
+
+func (e *ExtensionUnreachableError) Error() string {
+	return fmt.Sprintf(
+		"SketchUp extension not reachable on %s:%d — open SketchUp, install the su_mcp extension, and click Extensions → SketchupMCP → Start Server",
+		e.Host, e.Port,
+	)
+}
+
+func (e *ExtensionUnreachableError) Unwrap() error { return e.Cause }
+
+// SketchupTimeoutError signals that the per-call deadline tripped while
+// waiting on the SketchUp extension. SketchUp may be stuck on a modal
+// dialog or a long-running operation.
+type SketchupTimeoutError struct {
+	Budget time.Duration
+	Cause  error
+}
+
+func (e *SketchupTimeoutError) Error() string {
+	return fmt.Sprintf(
+		"SketchUp did not respond within %s — the extension may be stuck on a modal dialog or a long operation",
+		e.Budget,
+	)
+}
+
+func (e *SketchupTimeoutError) Unwrap() error { return e.Cause }

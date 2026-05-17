@@ -6,14 +6,35 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"reflect"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
 
 func newClient() *Client {
 	return &Client{Host: "localhost", Port: 9876, Timeout: time.Second}
+}
+
+// -- New constructor ---------------------------------------------------------
+
+func TestNew_DefaultsAndAddress(t *testing.T) {
+	c := New("h", 1)
+	if c.Host != "h" {
+		t.Errorf("Host: want %q, got %q", "h", c.Host)
+	}
+	if c.Port != 1 {
+		t.Errorf("Port: want 1, got %d", c.Port)
+	}
+	if c.Timeout != 3*time.Second {
+		t.Errorf("Timeout: want 3s, got %s", c.Timeout)
+	}
+	if c.CallTimeout != 120*time.Second {
+		t.Errorf("CallTimeout: want 120s, got %s", c.CallTimeout)
+	}
 }
 
 // -- unwrapResponse ----------------------------------------------------------
@@ -46,9 +67,10 @@ func TestUnwrap_EmptyMapWhenResultMissing(t *testing.T) {
 }
 
 func TestUnwrap_RaisesWithErrorMessage(t *testing.T) {
+	errVal := map[string]any{"message": "boom", "code": float64(-32000)}
 	env := map[string]any{
 		"jsonrpc": "2.0", "id": float64(1),
-		"error": map[string]any{"message": "boom"},
+		"error": errVal,
 	}
 	_, err := unwrapResponse(env)
 	if err == nil || !strings.Contains(err.Error(), "boom") {
@@ -57,6 +79,24 @@ func TestUnwrap_RaisesWithErrorMessage(t *testing.T) {
 	var se *SketchupError
 	if !errors.As(err, &se) {
 		t.Fatalf("want *SketchupError, got %T", err)
+	}
+	if !reflect.DeepEqual(se.Raw, errVal) {
+		t.Fatalf("Raw: got %v, want %v", se.Raw, errVal)
+	}
+}
+
+func TestUnwrap_NullErrorIsSuccess(t *testing.T) {
+	env := map[string]any{
+		"jsonrpc": "2.0", "id": float64(1),
+		"result": "ok",
+		"error":  nil,
+	}
+	got, err := unwrapResponse(env)
+	if err != nil {
+		t.Fatalf("want nil error for {error: null}, got %v", err)
+	}
+	if got != "ok" {
+		t.Fatalf("want result 'ok', got %v", got)
 	}
 }
 
@@ -155,6 +195,46 @@ func TestRead_RaisesOnMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestRead_ToleratesMissingTrailingNewline(t *testing.T) {
+	c := newClient()
+	server, client := net.Pipe()
+	defer client.Close()
+
+	go func() {
+		// Valid, complete JSON but no trailing '\n' before close.
+		_, _ = server.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"ok"}`))
+		_ = server.Close()
+	}()
+
+	got, err := c.readResponse(client)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := map[string]any{"jsonrpc": "2.0", "id": float64(1), "result": "ok"}
+	if !jsonEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestRead_RaisesMidResponseEOF(t *testing.T) {
+	c := newClient()
+	server, client := net.Pipe()
+	defer client.Close()
+
+	go func() {
+		_, _ = server.Write([]byte(`{"id":1,"result":"par`)) // truncated, no newline
+		_ = server.Close()
+	}()
+
+	_, err := c.readResponse(client)
+	if err == nil {
+		t.Fatal("want mid-response error, got nil")
+	}
+	if !strings.Contains(err.Error(), "connection dropped mid-response") {
+		t.Fatalf("want mid-response message, got %q", err.Error())
+	}
+}
+
 // -- connectWithRetries ------------------------------------------------------
 
 func TestConnect_SucceedsFirstAttempt(t *testing.T) {
@@ -191,6 +271,30 @@ func TestConnect_RetriesThenSucceeds(t *testing.T) {
 	_ = conn.Close()
 	if got := atomic.LoadInt32(&attempts); got != 3 {
 		t.Fatalf("want 3 attempts, got %d", got)
+	}
+}
+
+func TestConnect_FailsFastOnConnRefused(t *testing.T) {
+	c := newClient()
+	var attempts int32
+	c.Dialer = func() (net.Conn, error) {
+		atomic.AddInt32(&attempts, 1)
+		// Wrap ECONNREFUSED the way net.Dial would.
+		return nil, &net.OpError{Op: "dial", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}
+	}
+	_, err := c.connectWithRetries(2)
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Fatalf("ECONNREFUSED must skip retries; got %d attempts", got)
+	}
+	var ue *ExtensionUnreachableError
+	if !errors.As(err, &ue) {
+		t.Fatalf("want *ExtensionUnreachableError, got %T (%v)", err, err)
+	}
+	if !strings.Contains(ue.Error(), "extension not reachable") {
+		t.Fatalf("want friendly message, got %q", ue.Error())
 	}
 }
 
@@ -272,6 +376,24 @@ func TestSend_RetriesOnlyOnConnectFailures(t *testing.T) {
 	}
 }
 
+// TestSend_RetriesUpToBudgetThenFails pins the retry budget at the public
+// API boundary so it'd fail if SendCommand silently dropped retries below 2.
+func TestSend_RetriesUpToBudgetThenFails(t *testing.T) {
+	c := newClient()
+	var attempts int32
+	c.Dialer = func() (net.Conn, error) {
+		atomic.AddInt32(&attempts, 1)
+		return nil, errors.New("dial refused")
+	}
+	_, err := c.SendCommand("noop", nil, nil)
+	if err == nil {
+		t.Fatal("want error after exhausted retries, got nil")
+	}
+	if got := atomic.LoadInt32(&attempts); got != 3 {
+		t.Fatalf("want 3 dial attempts (budget=2 retries), got %d", got)
+	}
+}
+
 // -- SendCommand happy path --------------------------------------------------
 
 func TestSend_SerialisesRequestAndUnwrapsResult(t *testing.T) {
@@ -332,6 +454,44 @@ func TestSend_SerialisesRequestAndUnwrapsResult(t *testing.T) {
 	}
 }
 
+func TestSend_NilParamsSerializesAsEmptyObject(t *testing.T) {
+	c := newClient()
+	server, client := net.Pipe()
+	drainCh := make(chan []byte, 1)
+	go func() {
+		defer server.Close()
+		reader := bufio.NewReader(server)
+		line, _ := reader.ReadBytes('\n')
+		drainCh <- line
+		_, _ = server.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"ok"}` + "\n"))
+	}()
+	c.Dialer = func() (net.Conn, error) { return client, nil }
+
+	if _, err := c.SendCommand("noop", nil, float64(1)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	line := <-drainCh
+	if len(line) == 0 || line[len(line)-1] != '\n' {
+		t.Fatalf("expected newline-terminated payload, got %q", line)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(line[:len(line)-1], &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	params, ok := decoded["params"]
+	if !ok {
+		t.Fatal("envelope must include params key for nil-params call")
+	}
+	m, ok := params.(map[string]any)
+	if !ok {
+		t.Fatalf("params must be a JSON object, got %T", params)
+	}
+	if len(m) != 0 {
+		t.Fatalf("params must be {}, got %v", m)
+	}
+}
+
 func TestSend_PropagatesSketchupErrorEnvelope(t *testing.T) {
 	c := newClient()
 	server, client := net.Pipe()
@@ -346,6 +506,41 @@ func TestSend_PropagatesSketchupErrorEnvelope(t *testing.T) {
 	_, err := c.SendCommand("tools/call", nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "ruby boom") {
 		t.Fatalf("want 'ruby boom', got %v", err)
+	}
+}
+
+// -- CallTimeout / SketchupTimeoutError --------------------------------------
+
+func TestSend_TimesOutWhenSocketStalls(t *testing.T) {
+	c := newClient()
+	c.CallTimeout = 50 * time.Millisecond
+
+	server, client := net.Pipe()
+	defer server.Close()
+	// Server reads but never replies — simulates SketchUp accepting the
+	// connection then hanging on a modal dialog.
+	go func() {
+		reader := bufio.NewReader(server)
+		_, _ = reader.ReadBytes('\n')
+		// hold the socket open without responding
+		select {}
+	}()
+
+	c.Dialer = func() (net.Conn, error) { return client, nil }
+
+	_, err := c.SendCommand("noop", nil, nil)
+	if err == nil {
+		t.Fatal("want timeout error, got nil")
+	}
+	var te *SketchupTimeoutError
+	if !errors.As(err, &te) {
+		t.Fatalf("want *SketchupTimeoutError, got %T (%v)", err, err)
+	}
+	if te.Budget != 50*time.Millisecond {
+		t.Fatalf("want Budget=50ms, got %s", te.Budget)
+	}
+	if !strings.Contains(te.Error(), "SketchUp did not respond") {
+		t.Fatalf("want user-facing message, got %q", te.Error())
 	}
 }
 
