@@ -108,9 +108,6 @@ Once connected, Claude can interact with Sketchup using the following capabiliti
 * `get_selection` - Get information about currently selected components
 * `set_material` - Apply a material or color to a component
 * `export_scene` - Export the current scene (default format: `skp`)
-* `create_mortise_tenon` - Create a mortise-and-tenon joint between two components
-* `create_dovetail` - Create a dovetail joint between two components
-* `create_finger_joint` - Create a finger (box) joint between two components
 * `eval_ruby` - Execute arbitrary Ruby code in SketchUp for advanced operations
 
 #### Batching many operations
@@ -248,7 +245,6 @@ Here are some examples of what you can ask Claude to do:
 * "Make the selected component red"
 * "Move the selected component 10 units up"
 * "Export the current scene as a 3D model"
-* "Join those two boards with a dovetail joint"
 * "Create a complex arts and crafts cabinet using Ruby code"
 
 ## Troubleshooting
@@ -261,10 +257,7 @@ Here are some examples of what you can ask Claude to do:
 
 ### Communication Protocol
 
-The system uses a simple JSON-based protocol over TCP sockets:
-
-* **Commands** are sent as JSON objects with a `type` and optional `params`
-* **Responses** are JSON objects with a `status` and `result` or `message`
+The Go server and Ruby extension speak newline-terminated JSON-RPC 2.0 over TCP (default port 9876). Each call opens a fresh connection.
 
 ## Contributing
 
