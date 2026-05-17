@@ -837,16 +837,21 @@ module SU_MCP
         end
         create_extrusion(extrusion_params)
       when "translate"
-        transform_component(id_or_name_params(op["id_or_name"]).merge("position" => op["delta"]))
+        # Prefer "position" (matches transform_component's vocabulary); accept
+        # "delta" as a backwards-compat alias. Both missing → raise instead of
+        # silently no-op'ing (sch-gc5).
+        delta = op["position"] || op["delta"]
+        raise "translate op requires 'position' [dx,dy,dz]" if delta.nil?
+        transform_component(addressing_params(op).merge("position" => delta))
       when "move_to"
-        transform_component(id_or_name_params(op["id_or_name"]).merge("move_to" => op["target"]))
+        transform_component(addressing_params(op).merge("move_to" => op["target"]))
       when "delete"
-        entity = resolve_entity(id_or_name_params(op["id_or_name"]))
+        entity = resolve_entity(addressing_params(op))
         id = entity.entityID
         entity.erase!
         { id: id, success: true }
       when "replace"
-        replace_params = id_or_name_params(op["id_or_name"]).merge("geometry" => op["geometry"])
+        replace_params = addressing_params(op).merge("geometry" => op["geometry"])
         replace_params["recursive"] = op["recursive"] if op.key?("recursive")
         replace_geometry(replace_params)
       else
@@ -868,16 +873,42 @@ module SU_MCP
       end
     end
 
+    # Addressing helper for batch_create sub-ops (translate/move_to/delete/
+    # replace). Accepts the same "id" or "name" fields used everywhere else
+    # in the API; falls back to the legacy unified "id_or_name" field for
+    # backwards compatibility (sch-i7a). Raises if none are provided so a
+    # missing addressing key surfaces as an explicit error.
+    def addressing_params(op)
+      if op.key?("id") && !op["id"].nil?
+        { "id" => op["id"] }
+      elsif op.key?("name") && !op["name"].nil?
+        { "name" => op["name"] }
+      elsif op.key?("id_or_name") && !op["id_or_name"].nil?
+        id_or_name_params(op["id_or_name"])
+      else
+        raise "operation requires 'id' (entityID) or 'name' (group name)"
+      end
+    end
+
     # Compute the dimensions array that create_component's per-shape code
     # expects, from the more natural radius/height batch-op parameterization.
+    #
+    # Accepts either shape: an explicit "dimensions" array (create_component
+    # vocabulary, used by replace_geometry) or "radius"/"height" pair
+    # (batch_create vocabulary). Without the dimensions fallback for
+    # cylinder/sphere/cone, replace_geometry callers passing dimensions get
+    # [0,0,0] from `nil.to_f` and the constructor emits 24 colocated points,
+    # raising "Duplicate points in array" (sch-0q8).
     def primitive_dimensions(op)
       case op["op"].to_s
       when "cube"
         op["dimensions"]
       when "cylinder", "cone"
+        return op["dimensions"] if op["dimensions"]
         r = op["radius"].to_f
         [r * 2, r * 2, op["height"].to_f]
       when "sphere"
+        return op["dimensions"] if op["dimensions"]
         r = op["radius"].to_f
         [r * 2, r * 2, r * 2]
       end
@@ -1160,22 +1191,35 @@ module SU_MCP
       captured_material = target.material
       captured_layer = target.respond_to?(:layer) ? target.layer : nil
 
-      target.erase!
+      # Wrap erase + rebuild in a single SU operation so a mid-flight failure
+      # (e.g. a degenerate primitive that raises during construction) rolls
+      # back the target.erase! and leaves the original Group in the model.
+      # Without this, callers that hit a construction bug lose the source
+      # geometry permanently (sch-9d9).
+      model = Sketchup.active_model
+      model.start_operation("Replace geometry", true)
+      begin
+        target.erase!
 
-      new_group = build_replacement_group(geometry, captured_name)
+        new_group = build_replacement_group(geometry, captured_name)
 
-      # Re-apply captured attrs. Material set via assignment works on Groups;
-      # apply_material would re-pick a color, which we don't want — preserve
-      # exactly what was there.
-      new_group.material = captured_material if captured_material
-      if captured_layer && captured_layer.respond_to?(:valid?) && captured_layer.valid?
-        new_group.layer = captured_layer
+        # Re-apply captured attrs. Material set via assignment works on Groups;
+        # apply_material would re-pick a color, which we don't want — preserve
+        # exactly what was there.
+        new_group.material = captured_material if captured_material
+        if captured_layer && captured_layer.respond_to?(:valid?) && captured_layer.valid?
+          new_group.layer = captured_layer
+        end
+        new_group.name = captured_name if new_group.name != captured_name
+
+        out = bounds_result(new_group)
+        out[:name] = new_group.name
+        model.commit_operation
+        out
+      rescue StandardError
+        model.abort_operation
+        raise
       end
-      new_group.name = captured_name if new_group.name != captured_name
-
-      out = bounds_result(new_group)
-      out[:name] = new_group.name
-      out
     end
 
     # Pure: validate the geometry dict accepted by replace_geometry and the

@@ -110,6 +110,39 @@ class TestBatchCreate < Minitest::Test
     assert_equal [2.0, 2.0, 4.0], s.send(:primitive_dimensions, op)
   end
 
+  # -- sch-0q8: dimensions fallback for cylinder/sphere/cone ----------------
+  # replace_geometry forwards the geometry dict (create_component vocabulary)
+  # through this method. Without the fallback, "dimensions" is ignored and
+  # radius/height resolve to 0, producing degenerate primitives that raise
+  # "Duplicate points in array" inside create_component.
+
+  def test_primitive_dimensions_cylinder_accepts_dimensions
+    s = TestServer.new
+    op = { "op" => "cylinder", "dimensions" => [4, 4, 6] }
+    assert_equal [4, 4, 6], s.send(:primitive_dimensions, op)
+  end
+
+  def test_primitive_dimensions_sphere_accepts_dimensions
+    s = TestServer.new
+    op = { "op" => "sphere", "dimensions" => [6, 6, 6] }
+    assert_equal [6, 6, 6], s.send(:primitive_dimensions, op)
+  end
+
+  def test_primitive_dimensions_cone_accepts_dimensions
+    s = TestServer.new
+    op = { "op" => "cone", "dimensions" => [4, 4, 6] }
+    assert_equal [4, 4, 6], s.send(:primitive_dimensions, op)
+  end
+
+  def test_primitive_dimensions_cylinder_prefers_explicit_dimensions_over_radius
+    # If both are present (a caller bridging vocabularies), the explicit
+    # dimensions array wins — radius/height are a derivation from it, not
+    # the other way around.
+    s = TestServer.new
+    op = { "op" => "cylinder", "dimensions" => [4, 4, 6], "radius" => 99, "height" => 99 }
+    assert_equal [4, 4, 6], s.send(:primitive_dimensions, op)
+  end
+
   # -- validate_batch_op ----------------------------------------------------
 
   def test_validate_rejects_non_hash
@@ -381,6 +414,33 @@ class TestExecuteBatchOpDispatch < Minitest::Test
     refute params.key?("move_to"), "translate must not use move_to key"
   end
 
+  # -- sch-gc5: translate accepts "position" + raises on missing field ----
+
+  def test_translate_op_accepts_position_field
+    # transform_component's vocabulary uses "position" for relative
+    # translation; the translate op should match it so callers don't have
+    # to learn a separate vocabulary.
+    op = { "op" => "translate", "id_or_name" => "Ridge", "position" => [0, 0, 5] }
+    @server.send(:execute_batch_op, op)
+    _method, params = @server.calls.first
+    assert_equal [0, 0, 5], params["position"]
+  end
+
+  def test_translate_op_prefers_position_over_delta
+    op = { "op" => "translate", "id_or_name" => "Ridge", "position" => [0, 0, 5], "delta" => [9, 9, 9] }
+    @server.send(:execute_batch_op, op)
+    _method, params = @server.calls.first
+    assert_equal [0, 0, 5], params["position"]
+  end
+
+  def test_translate_op_raises_when_position_and_delta_missing
+    # Silent no-ops were the prior failure mode (sch-gc5). Surface the
+    # error so the caller knows their op didn't apply.
+    op = { "op" => "translate", "id_or_name" => "Ridge" }
+    err = assert_raises(RuntimeError) { @server.send(:execute_batch_op, op) }
+    assert_match(/position/, err.message)
+  end
+
   def test_move_to_op_dispatches_to_transform_component_with_move_to
     op = { "op" => "move_to", "id_or_name" => 42, "target" => [5, 5, 5] }
     @server.send(:execute_batch_op, op)
@@ -397,5 +457,52 @@ class TestExecuteBatchOpDispatch < Minitest::Test
     assert_equal [:resolve_entity, { "name" => "Old" }], @server.calls.first
     assert_equal 99, result[:id]
     assert_equal true, result[:success]
+  end
+
+  # -- sch-i7a: sub-ops accept "id"/"name" directly -------------------------
+
+  def test_translate_op_accepts_name_directly
+    op = { "op" => "translate", "name" => "Ridge", "position" => [1, 0, 0] }
+    @server.send(:execute_batch_op, op)
+    _method, params = @server.calls.first
+    assert_equal "Ridge", params["name"]
+    refute params.key?("id_or_name"), "id_or_name should not leak into transform_component params"
+  end
+
+  def test_translate_op_accepts_id_directly
+    op = { "op" => "translate", "id" => 42, "position" => [1, 0, 0] }
+    @server.send(:execute_batch_op, op)
+    _method, params = @server.calls.first
+    assert_equal 42, params["id"]
+  end
+
+  def test_move_to_op_accepts_name_directly
+    op = { "op" => "move_to", "name" => "Beam", "target" => [5, 5, 5] }
+    @server.send(:execute_batch_op, op)
+    _method, params = @server.calls.first
+    assert_equal "Beam", params["name"]
+    assert_equal [5, 5, 5], params["move_to"]
+  end
+
+  def test_delete_op_accepts_id_directly
+    op = { "op" => "delete", "id" => 99 }
+    @server.send(:execute_batch_op, op)
+    assert_equal [:resolve_entity, { "id" => 99 }], @server.calls.first
+  end
+
+  def test_addressing_raises_when_no_id_name_or_id_or_name
+    op = { "op" => "delete" }
+    err = assert_raises(RuntimeError) { @server.send(:execute_batch_op, op) }
+    assert_match(/'id'|'name'/, err.message)
+  end
+
+  def test_addressing_prefers_id_over_id_or_name
+    # If both are supplied, "id" wins. Keeps the alias from silently
+    # overriding the canonical field.
+    op = { "op" => "translate", "id" => 7, "id_or_name" => "Other", "position" => [0, 0, 1] }
+    @server.send(:execute_batch_op, op)
+    _method, params = @server.calls.first
+    assert_equal 7, params["id"]
+    refute params.key?("name")
   end
 end
