@@ -250,6 +250,8 @@ module SU_MCP
           mirror_component(args)
         when "validate_geometry"
           validate_geometry(args)
+        when "intersect_ray"
+          intersect_ray(args)
         when "chamfer_edges"
           chamfer_edges(args)
         when "fillet_edges"
@@ -1603,6 +1605,191 @@ module SU_MCP
 
     def format_tol(t)
       "#{format_num(t)}\""
+    end
+
+    # Tiny step past a previous hit so the next raytest doesn't re-hit the
+    # same face. 1e-4" is ~2.5 microns — far below any modeling tolerance.
+    INTERSECT_RAY_EPS = 1.0e-4
+
+    # Soft cap on hit-skipping iterations when a target is supplied. The loop
+    # advances past each face it doesn't want; this bounds runaway in case a
+    # caller targets something the ray will never reach.
+    INTERSECT_RAY_MAX_STEPS = 256
+
+    def intersect_ray(params)
+      log "intersect_ray params: #{params.inspect}"
+      origin = params["origin"]
+      direction = params["direction"]
+      raise "'origin' must be [x,y,z]" unless origin.is_a?(Array) && origin.length == 3
+      raise "'direction' must be [x,y,z]" unless direction.is_a?(Array) && direction.length == 3
+
+      origin_xyz = [origin[0].to_f, origin[1].to_f, origin[2].to_f]
+      dir_xyz = [direction[0].to_f, direction[1].to_f, direction[2].to_f]
+      mag = Math.sqrt(dir_xyz[0]**2 + dir_xyz[1]**2 + dir_xyz[2]**2)
+      # Tolerance check, not exact-zero — a tiny but non-zero direction would
+      # normalize to a garbage unit vector.
+      raise "'direction' must be non-zero" if mag < 1.0e-10
+      unit_dir = dir_xyz.map { |c| c / mag }
+
+      target = params["target"]
+      max_distance = params["max_distance"] ? params["max_distance"].to_f : nil
+      include_back = params.key?("include_back_faces") ? !!params["include_back_faces"] : false
+
+      model = Sketchup.active_model
+      raise "no active model" unless model
+
+      raycaster = lambda do |origin_arr|
+        pt = Geom::Point3d.new(origin_arr[0], origin_arr[1], origin_arr[2])
+        dvec = Geom::Vector3d.new(unit_dir[0], unit_dir[1], unit_dir[2])
+        result = model.raytest([pt, dvec], true)
+        next nil if result.nil?
+        hit_pt, path = result
+        face = path.reverse.find { |e| e.is_a?(Sketchup::Face) }
+        # Normal computation is lazy: when the loop discards a hit (wrong
+        # target, back face, distance over cap), the cumulative-transform
+        # math never runs. A step-cap-exhaustion path now does 0 normal
+        # computations instead of 256.
+        normal_fn = face ? lambda { n = world_normal_for_face(face, path); [n.x.to_f, n.y.to_f, n.z.to_f] } : nil
+        [[hit_pt.x.to_f, hit_pt.y.to_f, hit_pt.z.to_f], path, face, normal_fn]
+      end
+
+      intersect_ray_loop(origin_xyz, unit_dir, target, max_distance, include_back, raycaster)
+    end
+
+    # Pure-but-for-raycaster: drive the skip-and-retry loop with a callable
+    # that returns synthetic hits as [hit_point_xyz, path, face, normal_fn]
+    # tuples (or nil for a miss). `normal_fn` is a no-arg callable returning
+    # the face's world-space normal as [x,y,z]; it's only invoked when the
+    # loop reaches a back-face check or accepts the hit. Extracted from
+    # intersect_ray so tests can exercise target filtering, back-face
+    # culling, max_distance cutoff, and step-cap exhaustion without
+    # SketchUp.
+    def intersect_ray_loop(origin_xyz, unit_dir, target, max_distance, include_back, raycaster)
+      current = origin_xyz
+      INTERSECT_RAY_MAX_STEPS.times do
+        hit = raycaster.call(current)
+        return intersect_ray_miss(:miss) if hit.nil?
+
+        hit_pt, path, face, normal_fn = hit
+        distance = euclid_distance(origin_xyz, hit_pt)
+        return intersect_ray_miss(:max_distance_exceeded) if max_distance && distance > max_distance
+
+        group_match = if target
+                        find_target_group_in_path(path, target)
+                      else
+                        find_innermost_group_or_instance(path)
+                      end
+
+        if target && group_match.nil?
+          current = advance_xyz_along(hit_pt, unit_dir)
+          next
+        end
+
+        # Lazy normal: compute at most once per accepted hit, never for
+        # target-skipped ones. Reused for the back-face check and the
+        # face_normal field on the response.
+        normal_world = nil
+        if face && normal_fn && !include_back
+          normal_world = normal_fn.call
+          if normal_world && vec3_dot(unit_dir, normal_world) > 0
+            current = advance_xyz_along(hit_pt, unit_dir)
+            next
+          end
+        end
+        normal_world = normal_fn.call if face && normal_fn && normal_world.nil?
+
+        return {
+          success: true,
+          hit: true,
+          point: hit_pt,
+          distance: distance,
+          face_id: face ? face.entityID : nil,
+          group_name: group_match.respond_to?(:name) ? group_match.name : nil,
+          group_id: group_match ? group_match.entityID : nil,
+          face_normal: normal_world
+        }
+      end
+
+      intersect_ray_miss(:step_cap_exceeded)
+    end
+
+    # Pure: build the miss-response envelope. A clean ray-exits-geometry miss
+    # leaves `reason` absent so the common case stays terse; the
+    # max_distance / step_cap cases carry a reason so a caller debugging an
+    # unexpected miss can tell what fired.
+    def intersect_ray_miss(reason)
+      out = { success: true, hit: false }
+      out[:reason] = reason.to_s unless reason == :miss
+      out
+    end
+
+    # Pure-ish: walk a raytest path looking for a Group / ComponentInstance
+    # whose name (string target) or entityID (integer target) matches. Returns
+    # the matching node, or nil. Targets nest, so the *innermost* match wins —
+    # if the caller asked for "Wall A" and the ray hits a face inside a
+    # nested group inside Wall A, that's still a Wall A hit.
+    def find_target_group_in_path(path, target)
+      path.reverse.find do |e|
+        next false unless e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)
+        if target.is_a?(Integer) || (target.is_a?(String) && target =~ /\A-?\d+\z/)
+          e.entityID == target.to_i
+        else
+          e.respond_to?(:name) && e.name == target.to_s
+        end
+      end
+    end
+
+    # Pure: walk a raytest path looking for the innermost Group or
+    # ComponentInstance — the natural answer to "what was hit?" when the
+    # caller didn't pin a specific target.
+    def find_innermost_group_or_instance(path)
+      path.reverse.find { |e| e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance) }
+    end
+
+    # Compose the world transform for a face by accumulating every
+    # Group / ComponentInstance transform above it in the raytest path.
+    # The face itself doesn't carry a transform — its normal is in its
+    # parent's local space, so we transform by the cumulative parent.
+    def cumulative_path_transform(path)
+      t = Geom::Transformation.new
+      path.each do |node|
+        break if node.is_a?(Sketchup::Face)
+        t = t * node.transformation if node.respond_to?(:transformation)
+      end
+      t
+    end
+
+    # Face normal in world coordinates. NOTE: vec.transform(t) is correct
+    # for rigid transforms (translation, rotation, uniform scale, reflection)
+    # but not strictly correct under non-uniform scale, where the proper
+    # transform for normals is the inverse-transpose. SketchUp Groups
+    # typically carry rigid transforms (mirror_component included), so this
+    # is fine in practice; revisit if non-uniform scaling enters the picture.
+    def world_normal_for_face(face, path)
+      t = cumulative_path_transform(path)
+      n = face.normal.transform(t)
+      n.normalize!
+      n
+    end
+
+    # Pure: Euclidean distance between two [x,y,z] arrays.
+    def euclid_distance(a, b)
+      Math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2 + (a[2] - b[2])**2)
+    end
+
+    # Pure: dot product of two [x,y,z] arrays.
+    def vec3_dot(a, b)
+      a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    end
+
+    # Pure: step a small EPS past `point` along the unit direction so the
+    # next raytest doesn't re-hit the same face. Direction must be unit length.
+    def advance_xyz_along(point, unit_dir)
+      [
+        point[0] + unit_dir[0] * INTERSECT_RAY_EPS,
+        point[1] + unit_dir[1] * INTERSECT_RAY_EPS,
+        point[2] + unit_dir[2] * INTERSECT_RAY_EPS
+      ]
     end
 
     def inspect_geometry(params)
