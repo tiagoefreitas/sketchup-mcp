@@ -673,9 +673,29 @@ Kinds:
   All targets must share the same coordinate on the named axis/side.
   When value is given, the shared coordinate must equal it within tolerance.
 
-- {kind:"no_overlap", targets:[...], tolerance?}
+- {kind:"no_overlap", targets:[...], mode?, tolerance?}
   No two listed groups may have overlapping interiors. Penetration up to
-  tolerance on every axis is treated as a tight joint, not an overlap.
+  tolerance is treated as a tight joint, not an overlap.
+  mode is "aabb" (default) or "obb". AABB compares each group's axis-aligned
+  bounding box in world space — fast and tight for orthogonal stick framing
+  (studs, plates, joists). OBB uses each group's local-frame AABB rotated
+  into world space — needed for sloped or rotated pieces where the AABB is
+  much larger than the actual solid (e.g. a 2×6 rafter on a 6:12 slope, or a
+  lookout cut to sit flush against a sloped surface). OBB still treats
+  internal notches / voids as solid, so it doesn't fix every case — but it
+  removes false positives where the AABBs of two cleanly-touching sloped
+  pieces overlap.
+
+  Prerequisite for OBB to "win" over AABB: the group must be modeled in a
+  canonical local frame (e.g. a horizontal rafter as a 1.5×72×5.5 box) and
+  rotated into place via its transformation. For groups whose slope is
+  baked into the geometry itself (built with the slope already applied via
+  create_extrusion's sloped profile), the local-frame AABB equals the
+  world AABB and OBB collapses to AABB — no improvement. For those models,
+  use closest_points (which is volume-aware via a point-in-solid parity
+  check) as the regression-quality verifier instead. Picking the right
+  mode is a tradeoff: AABB is the right default; switch to OBB when
+  targets include rotated/sloped solids modeled in their local frame.
 
 Returns {results: [...], failed: <int>} where each result is
 {name, kind, passed, detail}. detail is short on pass and includes the
@@ -819,6 +839,12 @@ tolerance: optional inches; a surface gap within tolerance is reported as
   - distance >  tolerance              → "clear"
   - distance <= tolerance, no interior → "contact"
   - interiors penetrate                → "overlap" (distance returned negative)
+
+Nested-cavity geometry (tenon in mortise, dowel in hole, lookout in notch,
+drawer fully seated in a carcass) is classified as "contact": the surfaces
+are coincident but the solid volumes are disjoint. The classifier verifies
+this with a point-in-solid parity test on a small set of interior samples
+before reporting overlap, so a clean cavity fit doesn't false-positive.
 
 Returns {distance, point_a:[x,y,z], point_b:[x,y,z], status, face_a_id,
 face_b_id}. distance is signed: positive for a gap, 0 for a tight

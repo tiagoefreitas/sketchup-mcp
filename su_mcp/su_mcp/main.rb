@@ -1554,9 +1554,31 @@ module SU_MCP
 
     def run_no_overlap_assertion(a, model)
       tol = (a["tolerance"] || DEFAULT_VALIDATE_TOLERANCE).to_f
+      mode = (a["mode"] || "aabb").to_s
+      unless %w[aabb obb].include?(mode)
+        raise "no_overlap.mode must be \"aabb\" or \"obb\", got #{mode.inspect}"
+      end
       targets = a["targets"]
       raise "targets must be a non-empty array" unless targets.is_a?(Array) && !targets.empty?
       entities = targets.map { |t| resolve_validate_target(t, model) }
+      offenders =
+        if mode == "obb"
+          find_obb_overlap_offenders(entities, tol)
+        else
+          find_aabb_overlap_offenders(entities, tol)
+        end
+      if offenders.empty?
+        { passed: true,
+          detail: "no overlaps among #{entities.length} group(s) " \
+                  "(#{mode}, tolerance #{format_tol(tol)})" }
+      else
+        head = offenders.first(3).join("; ")
+        more = offenders.length > 3 ? "; (#{offenders.length - 3} more)" : ""
+        { passed: false, detail: head + more }
+      end
+    end
+
+    def find_aabb_overlap_offenders(entities, tol)
       offenders = []
       entities.each_with_index do |e1, i|
         b1 = e1.bounds
@@ -1573,13 +1595,286 @@ module SU_MCP
           end
         end
       end
-      if offenders.empty?
-        { passed: true, detail: "no overlaps among #{entities.length} group(s) (tolerance #{format_tol(tol)})" }
-      else
-        head = offenders.first(3).join("; ")
-        more = offenders.length > 3 ? "; (#{offenders.length - 3} more)" : ""
-        { passed: false, detail: head + more }
+      offenders
+    end
+
+    def find_obb_overlap_offenders(entities, tol)
+      obbs = entities.map { |e| group_obb(e) }
+      offenders = []
+      entities.each_with_index do |e1, i|
+        oa = obbs[i]
+        (i + 1...entities.length).each do |j|
+          ob = obbs[j]
+          depth = obb_overlap_depth(oa[:center], oa[:axes], ob[:center], ob[:axes])
+          # Same tolerance semantic as AABB: penetration up to tolerance is
+          # treated as a tight joint, not an overlap. Depth here is the
+          # minimum penetration over all SAT axes — the smallest distance
+          # one box would need to move to escape the other.
+          if depth > tol
+            offenders << "#{describe_for_overlap(entities[i])} ∩ #{describe_for_overlap(entities[j])} = " \
+                         "depth #{format_num(depth)}\""
+          end
+        end
       end
+      offenders
+    end
+
+    # Build a world-space OBB for a Group / ComponentInstance from its
+    # definition-frame AABB and its transformation. The local-frame AABB
+    # tightly wraps the piece's geometry in its modeling axes (e.g. a sloped
+    # 2×6 modeled on the X axis has a local bounds of width=length, height=5.5,
+    # depth=1.5 regardless of slope), so the world-space box obtained by
+    # rotating/translating it is the natural "tight" oriented box for stick-
+    # framing pieces.
+    #
+    # Falls back to the world AABB when the entity has no definition-frame
+    # bounds (rare — degenerate / non-instanced shapes). In that case OBB
+    # behaves the same as AABB for that piece.
+    #
+    # Returns {center: [x,y,z], axes: [[ax_x,ax_y,ax_z],
+    # [bx,by,bz], [cx,cy,cz]]}. The three axis vectors are half-extents:
+    # their length equals half the piece's size along that local axis, and
+    # their direction is the local axis transformed into world space.
+    def group_obb(entity)
+      local_bounds = nil
+      if entity.respond_to?(:definition) && entity.definition.respond_to?(:bounds)
+        local_bounds = entity.definition.bounds
+      end
+      if local_bounds.nil? || (local_bounds.respond_to?(:empty?) && local_bounds.empty?)
+        b = entity.bounds
+        return aabb_to_obb(b.min, b.max)
+      end
+      t = entity.respond_to?(:transformation) ? entity.transformation : Geom::Transformation.new
+      transform_local_aabb_to_obb(local_bounds.min, local_bounds.max, t)
+    end
+
+    # Pure: build an OBB hash from a degenerate identity-transform AABB. Used
+    # for groups without definition bounds — the OBB axes are world X/Y/Z.
+    def aabb_to_obb(min, max)
+      cx = (min.x.to_f + max.x.to_f) / 2.0
+      cy = (min.y.to_f + max.y.to_f) / 2.0
+      cz = (min.z.to_f + max.z.to_f) / 2.0
+      hx = (max.x.to_f - min.x.to_f) / 2.0
+      hy = (max.y.to_f - min.y.to_f) / 2.0
+      hz = (max.z.to_f - min.z.to_f) / 2.0
+      { center: [cx, cy, cz], axes: [[hx, 0.0, 0.0], [0.0, hy, 0.0], [0.0, 0.0, hz]] }
+    end
+
+    # Touches Sketchup::Transformation API. Extracts the column-major 4×4
+    # matrix and delegates the actual composition to the pure helper, so
+    # the math is testable without a live SketchUp.
+    def transform_local_aabb_to_obb(local_min, local_max, transformation)
+      compute_obb_from_local_aabb(
+        [local_min.x.to_f, local_min.y.to_f, local_min.z.to_f],
+        [local_max.x.to_f, local_max.y.to_f, local_max.z.to_f],
+        transformation.to_a
+      )
+    end
+
+    # Pure: world-space OBB from a local-frame AABB and a column-major 4×4
+    # transformation matrix (16 floats). The matrix's first three columns
+    # carry the world-space images of the local X/Y/Z basis vectors
+    # (scaled if the group is scaled); the fourth column is translation.
+    # World half-extent vector along local X is just basis_X · half_x, and
+    # similarly for Y/Z — so each output axis is one matrix column scaled
+    # by the half-width along that local axis.
+    def compute_obb_from_local_aabb(local_min, local_max, m)
+      cx = (local_min[0] + local_max[0]) / 2.0
+      cy = (local_min[1] + local_max[1]) / 2.0
+      cz = (local_min[2] + local_max[2]) / 2.0
+      hx = (local_max[0] - local_min[0]) / 2.0
+      hy = (local_max[1] - local_min[1]) / 2.0
+      hz = (local_max[2] - local_min[2]) / 2.0
+      {
+        center: [
+          m[0] * cx + m[4] * cy + m[8]  * cz + m[12],
+          m[1] * cx + m[5] * cy + m[9]  * cz + m[13],
+          m[2] * cx + m[6] * cy + m[10] * cz + m[14]
+        ],
+        axes: [
+          [m[0] * hx, m[1] * hx, m[2]  * hx],
+          [m[4] * hy, m[5] * hy, m[6]  * hy],
+          [m[8] * hz, m[9] * hz, m[10] * hz]
+        ]
+      }
+    end
+
+    # Pure: SAT-based oriented-box overlap depth. Each OBB is a center plus
+    # three half-extent vectors (their length is the half-width along that
+    # axis; direction is the world-space axis). Returns the minimum overlap
+    # across the 15 candidate separating axes (3 from A, 3 from B, 9 cross
+    # products): positive = boxes interpenetrate by that amount, ≤ 0 = the
+    # axis with that gap proves them separated.
+    #
+    # Cross-product axes whose magnitude squared is below OBB_AXIS_EPS are
+    # skipped — they appear when an A-axis is nearly parallel to a B-axis,
+    # in which case the SAT result is already covered by one of the box axes.
+    def obb_overlap_depth(a_center, a_axes, b_center, b_axes)
+      d = [b_center[0] - a_center[0], b_center[1] - a_center[1], b_center[2] - a_center[2]]
+      candidates = []
+      a_axes.each do |v|
+        u = vec_unit(v)
+        candidates << u unless u.nil?
+      end
+      b_axes.each do |v|
+        u = vec_unit(v)
+        candidates << u unless u.nil?
+      end
+      a_axes.each do |va|
+        b_axes.each do |vb|
+          c = vec_cross(va, vb)
+          u = vec_unit(c)
+          candidates << u unless u.nil?
+        end
+      end
+      min_overlap = Float::INFINITY
+      candidates.each do |n|
+        r_a = a_axes.inject(0.0) { |s, ax| s + vec_dot(ax, n).abs }
+        r_b = b_axes.inject(0.0) { |s, ax| s + vec_dot(ax, n).abs }
+        sep = vec_dot(d, n).abs
+        overlap = r_a + r_b - sep
+        return overlap if overlap < 0
+        min_overlap = overlap if overlap < min_overlap
+      end
+      min_overlap
+    end
+
+    # Cross-product axes below this squared magnitude are treated as
+    # numerically zero — projecting onto them is meaningless and the box-
+    # axis candidates already cover the same separating direction.
+    OBB_AXIS_EPS_SQ = 1.0e-12
+
+    def vec_cross(a, b)
+      [a[1] * b[2] - a[2] * b[1],
+       a[2] * b[0] - a[0] * b[2],
+       a[0] * b[1] - a[1] * b[0]]
+    end
+
+    def vec_dot(a, b)
+      a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    end
+
+    def vec_unit(v)
+      mag_sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
+      return nil if mag_sq < OBB_AXIS_EPS_SQ
+      m = Math.sqrt(mag_sq)
+      [v[0] / m, v[1] / m, v[2] / m]
+    end
+
+    # Offset distance (inches) when stepping inward from a face centroid to
+    # land an interior sample. 0.001" is well below SketchUp's 1/16" modeling
+    # tolerance — small enough to stay inside even a thin sliver — but large
+    # enough that the parity test isn't fooled by the face it just stepped
+    # off of.
+    INTERIOR_SAMPLE_EPS = 1.0e-3
+
+    # Default ray direction for point-in-solid parity. Picked with small
+    # irrational offsets in Y and Z to make grazing axis-aligned edges or
+    # vertices ~impossible — those are the cases where parity can over- or
+    # under-count.
+    POINT_IN_SOLID_RAY_DIR = [1.0, Math.sqrt(2) / 100.0, Math.sqrt(3) / 200.0].freeze
+
+    # Pure: triangle centroid as [x,y,z].
+    def triangle_centroid(pts)
+      [(pts[0][0] + pts[1][0] + pts[2][0]) / 3.0,
+       (pts[0][1] + pts[1][1] + pts[2][1]) / 3.0,
+       (pts[0][2] + pts[1][2] + pts[2][2]) / 3.0]
+    end
+
+    # Pure: unit normal of a triangle (right-hand rule from vertex order).
+    # Returns nil for a degenerate (collinear) triangle.
+    def triangle_normal(pts)
+      e1 = [pts[1][0] - pts[0][0], pts[1][1] - pts[0][1], pts[1][2] - pts[0][2]]
+      e2 = [pts[2][0] - pts[0][0], pts[2][1] - pts[0][1], pts[2][2] - pts[0][2]]
+      vec_unit(vec_cross(e1, e2))
+    end
+
+    # Pure: Möller–Trumbore ray/triangle intersection. dir need not be unit.
+    # Returns true iff the ray strikes the triangle strictly in front of the
+    # origin. Hits exactly at the origin (t≈0) are excluded so an interior
+    # sample point that started on or near a face doesn't count itself.
+    def ray_intersects_triangle?(origin, dir, tri)
+      v0, v1, v2 = tri
+      e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]]
+      e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]]
+      h = vec_cross(dir, e2)
+      a = vec_dot(e1, h)
+      return false if a.abs < 1.0e-12
+      f = 1.0 / a
+      s = [origin[0] - v0[0], origin[1] - v0[1], origin[2] - v0[2]]
+      u = f * vec_dot(s, h)
+      return false if u < 0.0 || u > 1.0
+      q = vec_cross(s, e1)
+      v = f * vec_dot(dir, q)
+      return false if v < 0.0 || u + v > 1.0
+      t = f * vec_dot(e2, q)
+      t > 1.0e-9
+    end
+
+    # Pure: point-in-closed-solid via ray-parity. Casts a ray from `point`
+    # along `direction` (default: POINT_IN_SOLID_RAY_DIR) and counts how many
+    # of `triangles` it pierces. Odd = inside, even = outside.
+    #
+    # Assumes the triangle set forms a closed, consistently-oriented surface,
+    # which is what world_triangles_for_group produces for a manifold group.
+    # For an open / non-manifold shell, parity is ambiguous and the result
+    # is best-effort.
+    def point_in_solid?(point, triangles, direction = POINT_IN_SOLID_RAY_DIR)
+      count = 0
+      triangles.each do |t|
+        count += 1 if ray_intersects_triangle?(point, direction, t[:points])
+      end
+      count.odd?
+    end
+
+    # How many face-centroid offsets to spread across a mesh for the
+    # interior-point check. 8 keeps the parity cost trivial vs. the existing
+    # tri-pair search while giving enough coverage to catch a real overlap
+    # somewhere in the mesh even on concave / L-shaped pieces.
+    INTERIOR_SAMPLE_FACE_COUNT = 8
+
+    # Build a small set of points known to lie inside the entity's solid by
+    # stepping inward from triangle centroids along the (inward) face
+    # normal. Each sample is in the body's material by construction —
+    # unlike AABB-center sampling, which fails for solids with cavities
+    # carved at their geometric center (the nested-cavity case).
+    #
+    # Assumes triangle vertex order encodes outward normals (right-hand
+    # rule), which is what world_triangles_for_group produces for a
+    # consistently-oriented group. A piece with all faces reversed via
+    # SketchUp's "Reverse Faces" would step *out* of the solid; in that
+    # case every sample lands outside and overlap is silently downgraded
+    # to contact. The 8-sample redundancy doesn't save a systematically-
+    # flipped piece — fix the model's orientation in that case.
+    def interior_sample_points(triangles)
+      return [] if triangles.empty?
+      pts = []
+      step = [(triangles.length / INTERIOR_SAMPLE_FACE_COUNT.to_f).ceil, 1].max
+      triangles.each_with_index do |t, i|
+        next unless (i % step).zero?
+        n = triangle_normal(t[:points])
+        next if n.nil?
+        tc = triangle_centroid(t[:points])
+        pts << [tc[0] - INTERIOR_SAMPLE_EPS * n[0],
+                tc[1] - INTERIOR_SAMPLE_EPS * n[1],
+                tc[2] - INTERIOR_SAMPLE_EPS * n[2]]
+      end
+      pts
+    end
+
+    # True iff the two solid volumes actually share interior space. False
+    # for the nested-cavity case (one part sits in a void in the other,
+    # surfaces coincident but volumes disjoint). The AABB-strict-overlap
+    # signal alone can't tell these apart; parity-testing interior samples
+    # of each against the other's mesh can.
+    def volumes_actually_intersect?(tris_a, tris_b)
+      interior_sample_points(tris_a).each do |p|
+        return true if point_in_solid?(p, tris_b)
+      end
+      interior_sample_points(tris_b).each do |p|
+        return true if point_in_solid?(p, tris_a)
+      end
+      false
     end
 
     # Pure: per-axis penetration depth between two AABBs. A negative or
@@ -1826,6 +2121,15 @@ module SU_MCP
       b_bounds = ent_b.bounds
       ox, oy, oz = aabb_overlap_extents(a_bounds.min, a_bounds.max, b_bounds.min, b_bounds.max)
       status, signed_distance = closest_points_classify(best[:distance], ox, oy, oz, tol)
+      # AABB-based overlap is a false positive when one part fits cleanly
+      # inside the other's cavity (tenon-in-mortise, lookout-in-notch, drawer
+      # -in-carcass). Volume parity test downgrades to contact when the
+      # surfaces are coincident but neither solid contains an interior point
+      # of the other.
+      if status == "overlap" && !volumes_actually_intersect?(tris_a, tris_b)
+        status = "contact"
+        signed_distance = best[:distance]
+      end
 
       {
         success: true,
