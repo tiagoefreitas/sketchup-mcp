@@ -1,0 +1,4 @@
+interface:
+  display_name: "SketchUp MCP"
+  short_description: "Drive SketchUp through the local MCP bridge"
+  default_prompt: "Use $sketchup-mcp to inspect and edit the live SketchUp model safely."
