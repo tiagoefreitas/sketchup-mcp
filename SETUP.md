@@ -12,23 +12,23 @@ Compared with the reviewed alternatives:
 
 ## Local Runtime
 
-The v2.0.0 darwin/arm64 release binary is installed at:
+The project-local MCP binary is installed at:
 
 ```sh
 /Users/coolkcah/Documents/sketchup/bin/sketchup-mcp
 ```
 
-The SketchUp extension package is installed in the repo at:
+The rebuilt SketchUp extension package is installed in the repo at:
 
 ```sh
-/Users/coolkcah/Documents/sketchup/dist/su_mcp_v2.0.0.rbz
+/Users/coolkcah/Documents/sketchup/dist/su_mcp_vlocal.rbz
 ```
 
 Install the RBZ in SketchUp with:
 
 1. Open SketchUp.
 2. Window > Extension Manager > Install Extension.
-3. Select `dist/su_mcp_v2.0.0.rbz`.
+3. Select `dist/su_mcp_vlocal.rbz`.
 4. Restart SketchUp.
 5. Start the bridge with Extensions > MCP Server > Start Server.
 

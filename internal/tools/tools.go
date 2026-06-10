@@ -161,6 +161,13 @@ func RegisterAll(server *mcp.Server, s Sender) {
 	registerInspectGeometry(server, s)
 	registerFindGroups(server, s)
 	registerGetSelection(server, s)
+	registerPing(server, s)
+	registerUnitsInfo(server, s)
+	registerMeasure(server, s)
+	registerListDefinitions(server, s)
+	registerListInstances(server, s)
+	registerSelect(server, s)
+	registerUndoLast(server, s)
 	registerSetMaterial(server, s)
 	registerExportScene(server, s)
 	registerBooleanOp(server, s)
@@ -452,6 +459,95 @@ func registerGetSelection(srv *mcp.Server, s Sender) {
 		Description: "Get currently selected components",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in GetSelectionInput) (*mcp.CallToolResult, any, error) {
 		return callSketchup(s, "get_selection", in)
+	})
+}
+
+func registerPing(srv *mcp.Server, s Sender) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ping",
+		Description: "Health-check the SketchUp Ruby extension and return its version/timestamp.",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in PingInput) (*mcp.CallToolResult, any, error) {
+		return callSketchup(s, "ping", in)
+	})
+}
+
+func registerUnitsInfo(srv *mcp.Server, s Sender) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "units_info",
+		Description: `Return the active model's length unit settings and inch/cm
+conversion factors. SketchUp stores geometry internally in inches; use this
+before interpreting user-facing dimensions or converting external data.`,
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in UnitsInfoInput) (*mcp.CallToolResult, any, error) {
+		return callSketchup(s, "units_info", in)
+	})
+}
+
+func registerMeasure(srv *mcp.Server, s Sender) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "measure",
+		Description: `Inspect one entity by entity ID. Returns class, validity,
+name/definition when available, material, world bounds in inches, size, and
+transformation origin for transformable entities.`,
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in MeasureInput) (*mcp.CallToolResult, any, error) {
+		if in.ID <= 0 {
+			return textResult(failureEnvelope(fmt.Sprintf("id must be a positive entity ID, got %d", in.ID))), nil, nil
+		}
+		return callSketchup(s, "measure", in)
+	})
+}
+
+func registerListDefinitions(srv *mcp.Server, s Sender) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "list_definitions",
+		Description: `List component definitions in the active model. Optional
+name_pattern is a Ruby regular expression matched case-insensitively; set
+include_bounds=false to omit definition bounds for a smaller payload.`,
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in ListDefinitionsInput) (*mcp.CallToolResult, any, error) {
+		return callSketchup(s, "list_definitions", in)
+	})
+}
+
+func registerListInstances(srv *mcp.Server, s Sender) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "list_instances",
+		Description: `List groups and, optionally, component instances in the active model.
+
+Filters combine with AND:
+- definition_name: exact component-definition name, or exact group name.
+- name_pattern: Ruby regular expression matched case-insensitively against
+  group name or component definition name.
+- bounds: {min:[x,y,z], max:[x,y,z]} intersection filter in inches.
+
+By default this scans top-level groups only. Set recursive=true to descend
+into nested groups; set include_components=true to include ComponentInstance
+matches as well. limit defaults to 500.`,
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in ListInstancesInput) (*mcp.CallToolResult, any, error) {
+		if in.Limit != nil && *in.Limit < 1 {
+			return textResult(failureEnvelope(fmt.Sprintf("limit must be >= 1, got %d", *in.Limit))), nil, nil
+		}
+		return callSketchup(s, "list_instances", in)
+	})
+}
+
+func registerSelect(srv *mcp.Server, s Sender) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "select",
+		Description: "Replace the current SketchUp selection with the given entity IDs.",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in SelectInput) (*mcp.CallToolResult, any, error) {
+		return callSketchup(s, "select", in)
+	})
+}
+
+func registerUndoLast(srv *mcp.Server, s Sender) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "undo_last",
+		Description: `Undo the last SketchUp operation one or more times. Use
+sparingly; most MCP mutation tools already wrap their work as a single undo step.`,
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in UndoLastInput) (*mcp.CallToolResult, any, error) {
+		if in.Steps != nil && *in.Steps < 1 {
+			return textResult(failureEnvelope(fmt.Sprintf("steps must be >= 1, got %d", *in.Steps))), nil, nil
+		}
+		return callSketchup(s, "undo_last", in)
 	})
 }
 

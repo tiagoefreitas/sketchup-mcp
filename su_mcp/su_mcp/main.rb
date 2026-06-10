@@ -238,6 +238,20 @@ module SU_MCP
           replace_geometry(args)
         when "get_selection"
           get_selection
+        when "ping"
+          ping(args)
+        when "units_info"
+          units_info(args)
+        when "measure"
+          measure(args)
+        when "list_definitions"
+          list_definitions(args)
+        when "list_instances"
+          list_instances(args)
+        when "select"
+          select_entities(args)
+        when "undo_last"
+          undo_last(args)
         when "export", "export_scene"
           export_scene(args)
         when "set_material"
@@ -1389,6 +1403,181 @@ module SU_MCP
       return false if emax.y < qmin[1] || emin.y > qmax[1]
       return false if emax.z < qmin[2] || emin.z > qmax[2]
       true
+    end
+
+    def ping(_params)
+      {
+        success: true,
+        pong: true,
+        version: "local",
+        time: Time.now.to_f
+      }
+    end
+
+    def units_info(_params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      opts = model.options["UnitsOptions"]
+      unit_code = opts["LengthUnit"]
+      unit_names = {
+        0 => "inches",
+        1 => "feet",
+        2 => "millimeters",
+        3 => "centimeters",
+        4 => "meters"
+      }
+      {
+        success: true,
+        length_unit_code: unit_code,
+        length_unit_name: unit_names[unit_code] || "unknown",
+        inches_per_centimeter: 1.cm.to_f,
+        centimeters_per_inch: 1.0 / 1.cm.to_f,
+        model_title: model.title,
+        model_path: model.path
+      }
+    end
+
+    def measure(params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      entity_id = params["id"].to_i
+      entity = model.find_entity_by_id(entity_id)
+      raise "No entity with id=#{entity_id}" unless entity
+
+      out = {
+        success: true,
+        id: entity.entityID,
+        type: entity.typename.downcase,
+        ruby_class: entity.class.name,
+        valid: entity.valid?
+      }
+      out[:name] = entity.name if entity.respond_to?(:name)
+      out[:definition] = entity.definition.name if entity.respond_to?(:definition) && entity.definition
+      out[:bounds] = bounds_payload(entity.bounds) if entity.respond_to?(:bounds)
+      out[:origin] = point_payload(entity.transformation.origin) if entity.respond_to?(:transformation)
+      out[:material] = material_payload(entity.material) if entity.respond_to?(:material) && entity.material
+      out
+    end
+
+    def list_definitions(params)
+      params ||= {}
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      pattern = params["name_pattern"] ? Regexp.new(params["name_pattern"].to_s, Regexp::IGNORECASE) : nil
+      include_bounds = params["include_bounds"] != false
+
+      definitions = model.definitions.map do |definition|
+        next if pattern && !pattern.match?(definition.name.to_s)
+
+        entry = {
+          name: definition.name,
+          guid: (definition.guid rescue nil),
+          instance_count: definition.count_instances,
+          image: definition.respond_to?(:image?) ? definition.image? : false
+        }
+        entry[:bounds] = bounds_payload(definition.bounds) if include_bounds
+        entry
+      end.compact
+
+      { success: true, count: definitions.length, definitions: definitions }
+    end
+
+    def list_instances(params)
+      params ||= {}
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      definition_name = params["definition_name"]
+      pattern = params["name_pattern"] ? Regexp.new(params["name_pattern"].to_s, Regexp::IGNORECASE) : nil
+      bounds_filter = params["bounds"]
+      limit = [(params["limit"] || 500).to_i, 1].max
+      recursive = params["recursive"] ? true : false
+      include_components = params["include_components"] ? true : false
+
+      walker = recursive ? walk_entities_recursive(model.entities) : model.entities.to_a
+      instances = []
+      truncated = false
+
+      walker.each do |entity|
+        next unless entity_matches_kind?(entity, include_components)
+        instance_name = inventory_entity_name(entity)
+        next if definition_name && instance_name != definition_name.to_s
+        next if pattern && !pattern.match?(instance_name.to_s)
+        next unless bounds_matches?(entity.bounds, bounds_filter)
+
+        if instances.length >= limit
+          truncated = true
+          break
+        end
+        entry = describe_match(entity)
+        entry[:definition] = entity.definition.name if entity.respond_to?(:definition) && entity.definition
+        entry[:origin] = point_payload(entity.transformation.origin) if entity.respond_to?(:transformation)
+        instances << entry
+      end
+
+      { success: true, count: instances.length, instances: instances, truncated: truncated }
+    end
+
+    def select_entities(params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      ids = Array(params["ids"]).map(&:to_i)
+      resolved = ids.map { |id| model.find_entity_by_id(id) }.compact
+      model.selection.clear
+      model.selection.add(resolved) unless resolved.empty?
+
+      {
+        success: true,
+        requested: ids.length,
+        selected: resolved.length,
+        missing: ids.length - resolved.length
+      }
+    end
+
+    def undo_last(params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      steps = [(params && params["steps"] || 1).to_i, 1].max
+      undone = 0
+      steps.times do
+        break unless model.undo_operation
+        undone += 1
+      end
+      { success: true, requested: steps, undone: undone }
+    end
+
+    def bounds_payload(bounds)
+      {
+        min: point_payload(bounds.min),
+        max: point_payload(bounds.max),
+        size: [bounds.width.to_f, bounds.height.to_f, bounds.depth.to_f]
+      }
+    end
+
+    def point_payload(point)
+      [point.x.to_f, point.y.to_f, point.z.to_f]
+    end
+
+    def material_payload(material)
+      {
+        name: material.display_name,
+        color: material.color.to_a
+      }
+    end
+
+    def inventory_entity_name(entity)
+      if entity.is_a?(Sketchup::ComponentInstance) && entity.respond_to?(:definition)
+        entity.definition.name
+      elsif entity.respond_to?(:name)
+        entity.name
+      else
+        ""
+      end
     end
 
     # Default contact / alignment / overlap tolerance, matched to the
@@ -3282,7 +3471,7 @@ module SU_MCP
     menu = UI.menu("Plugins").add_submenu("MCP Server")
     menu.add_item("Start Server") { @server.start }
     menu.add_item("Stop Server") { @server.stop }
-    
+
     file_loaded(__FILE__)
   end
-end 
+end

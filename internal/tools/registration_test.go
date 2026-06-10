@@ -61,11 +61,18 @@ func TestRegisterAll_ExposesExpectedToolNames(t *testing.T) {
 		"get_selection",
 		"inspect_geometry",
 		"intersect_ray",
+		"list_definitions",
+		"list_instances",
+		"measure",
 		"mirror_component",
 		"pattern_linear",
+		"ping",
 		"replace_geometry",
+		"select",
 		"set_material",
 		"transform_component",
+		"undo_last",
+		"units_info",
 		"validate_geometry",
 	}
 

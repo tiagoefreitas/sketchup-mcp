@@ -87,6 +87,43 @@ type FindGroupsInput struct {
 // GetSelectionInput is the (empty) input for the get_selection tool.
 type GetSelectionInput struct{}
 
+// PingInput is the empty input for the ping tool.
+type PingInput struct{}
+
+// UnitsInfoInput is the empty input for the units_info tool.
+type UnitsInfoInput struct{}
+
+// MeasureInput backs the measure tool.
+type MeasureInput struct {
+	ID int64 `json:"id"`
+}
+
+// ListDefinitionsInput backs the list_definitions tool.
+type ListDefinitionsInput struct {
+	NamePattern   *string `json:"name_pattern,omitempty"`
+	IncludeBounds *bool   `json:"include_bounds,omitempty"`
+}
+
+// ListInstancesInput backs the list_instances tool.
+type ListInstancesInput struct {
+	DefinitionName    *string              `json:"definition_name,omitempty"`
+	NamePattern       *string              `json:"name_pattern,omitempty"`
+	Bounds            map[string][]float64 `json:"bounds,omitempty"`
+	Limit             *int                 `json:"limit,omitempty"`
+	Recursive         *bool                `json:"recursive,omitempty"`
+	IncludeComponents *bool                `json:"include_components,omitempty"`
+}
+
+// SelectInput backs the select tool.
+type SelectInput struct {
+	IDs []int64 `json:"ids"`
+}
+
+// UndoLastInput backs the undo_last tool.
+type UndoLastInput struct {
+	Steps *int `json:"steps,omitempty"`
+}
+
 // SetMaterialInput backs the set_material tool.
 type SetMaterialInput struct {
 	ID       string `json:"id"`

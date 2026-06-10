@@ -1082,6 +1082,58 @@ func TestToolForwardsExpectedArguments(t *testing.T) {
 			expectedRubyArgs:   map[string]any{},
 		},
 		{
+			toolName:           "ping",
+			mcpArgs:            map[string]any{},
+			expectedRubyMethod: "ping",
+			expectedRubyArgs:   map[string]any{},
+		},
+		{
+			toolName:           "units_info",
+			mcpArgs:            map[string]any{},
+			expectedRubyMethod: "units_info",
+			expectedRubyArgs:   map[string]any{},
+		},
+		{
+			toolName:           "measure",
+			mcpArgs:            map[string]any{"id": 123},
+			expectedRubyMethod: "measure",
+			expectedRubyArgs:   map[string]any{"id": float64(123)},
+		},
+		{
+			toolName:           "list_definitions",
+			mcpArgs:            map[string]any{"name_pattern": "chair", "include_bounds": false},
+			expectedRubyMethod: "list_definitions",
+			expectedRubyArgs:   map[string]any{"name_pattern": "chair", "include_bounds": false},
+		},
+		{
+			toolName: "list_instances",
+			mcpArgs: map[string]any{
+				"definition_name":    "Chair",
+				"limit":              10,
+				"recursive":          true,
+				"include_components": true,
+			},
+			expectedRubyMethod: "list_instances",
+			expectedRubyArgs: map[string]any{
+				"definition_name":    "Chair",
+				"limit":              float64(10),
+				"recursive":          true,
+				"include_components": true,
+			},
+		},
+		{
+			toolName:           "select",
+			mcpArgs:            map[string]any{"ids": []any{1.0, 2.0}},
+			expectedRubyMethod: "select",
+			expectedRubyArgs:   map[string]any{"ids": []any{1.0, 2.0}},
+		},
+		{
+			toolName:           "undo_last",
+			mcpArgs:            map[string]any{"steps": 2},
+			expectedRubyMethod: "undo_last",
+			expectedRubyArgs:   map[string]any{"steps": float64(2)},
+		},
+		{
 			toolName:           "set_material",
 			mcpArgs:            map[string]any{"id": "x", "material": "wood"},
 			expectedRubyMethod: "set_material",

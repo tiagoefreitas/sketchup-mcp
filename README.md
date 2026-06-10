@@ -125,6 +125,13 @@ binary lives on your `PATH`).
 * `pattern_linear` — Replicate a Group along a vector (linear array) — typical for studs, rafters, fence posts
 * `mirror_component` — Reflect a Group across a plane (bilateral symmetry counterpart to `pattern_linear`)
 * `get_selection` — Get information about currently selected components
+* `ping` — Health-check the SketchUp Ruby extension
+* `units_info` — Return model unit settings and inch/cm conversion factors
+* `measure` — Inspect one entity by ID, including bounds, origin, material, and definition/name metadata
+* `list_definitions` — List component definitions, optionally filtered by name regex
+* `list_instances` — List groups and component instances with name, bounds, definition, recursion, and bounds filters
+* `select` — Replace the current SketchUp selection with a list of entity IDs
+* `undo_last` — Undo one or more SketchUp operations
 * `set_material` — Apply a material or color to a component
 * `export_scene` — Export the current scene to skp/obj/dae/stl/png/jpg. With `format=png` it doubles as a visual snapshot tool; optional `width`/`height` and `camera={eye, target, up?, perspective?, fov?}` let an agent compose a specific framed shot at a context-friendly size, and the user's SketchUp camera is restored after the render
 * `eval_ruby` — Execute arbitrary Ruby code in SketchUp for advanced operations
