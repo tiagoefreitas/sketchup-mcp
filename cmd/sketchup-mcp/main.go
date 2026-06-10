@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -19,8 +21,10 @@ import (
 var version = "dev"
 
 func main() {
-	host := flag.String("host", "localhost", "SketchUp Ruby extension host")
-	port := flag.Int("port", 9876, "SketchUp Ruby extension port")
+	host := flag.String("host", envString("SKETCHUP_MCP_HOST", "localhost"), "SketchUp Ruby extension host")
+	port := flag.Int("port", envInt("SKETCHUP_MCP_PORT", 9876), "SketchUp Ruby extension port")
+	dialTimeout := flag.Duration("dial-timeout", envDuration("SKETCHUP_MCP_DIAL_TIMEOUT", 3*time.Second), "SketchUp TCP dial timeout")
+	callTimeout := flag.Duration("call-timeout", envDuration("SKETCHUP_MCP_CALL_TIMEOUT", 120*time.Second), "SketchUp request/response timeout")
 	flag.Parse()
 
 	// Logs must go to stderr — stdout is the MCP transport.
@@ -28,6 +32,8 @@ func main() {
 	slog.Info("SketchupMCP server starting", "version", version)
 
 	client := skpclient.New(*host, *port)
+	client.Timeout = *dialTimeout
+	client.CallTimeout = *callTimeout
 	reachable := client.Probe()
 	if !reachable {
 		slog.Warn("SketchUp not reachable; make sure the extension is running and Start Server has been clicked")
@@ -46,6 +52,42 @@ func main() {
 		fmt.Fprintln(os.Stderr, "server exited with error:", err)
 		os.Exit(1)
 	}
+}
+
+func envString(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func envInt(name string, fallback int) int {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid %s=%q, using %d\n", name, value, fallback)
+		return fallback
+	}
+	return n
+}
+
+func envDuration(name string, fallback time.Duration) time.Duration {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	if d, err := time.ParseDuration(value); err == nil {
+		return d
+	}
+	seconds, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid %s=%q, using %s\n", name, value, fallback)
+		return fallback
+	}
+	return time.Duration(seconds * float64(time.Second))
 }
 
 // buildInstructions returns the MCP Instructions string, appending a
