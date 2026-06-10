@@ -3472,6 +3472,10 @@ module SU_MCP
     menu.add_item("Start Server") { @server.start }
     menu.add_item("Stop Server") { @server.stop }
 
+    if ENV["SKETCHUP_MCP_AUTOSTART"] != "0"
+      UI.start_timer(0, false) { @server.start }
+    end
+
     file_loaded(__FILE__)
   end
 end

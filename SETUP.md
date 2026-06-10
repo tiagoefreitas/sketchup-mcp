@@ -32,6 +32,17 @@ Install the RBZ in SketchUp with:
 4. Restart SketchUp.
 5. Start the bridge with Extensions > MCP Server > Start Server.
 
+For local development, direct-install the extension into SketchUp's Plugins
+folder instead:
+
+```sh
+scripts/install_sketchup_extension.sh
+```
+
+The direct install also writes `zz_su_mcp_autostart.rb`, so SketchUp loads
+the bridge and starts listening on `127.0.0.1:9876` at startup. Set
+`SKETCHUP_MCP_AUTOSTART=0` before launching SketchUp to disable autostart.
+
 ## Codex MCP Config
 
 The active Codex config contains:
